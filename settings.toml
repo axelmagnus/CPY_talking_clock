@@ -1,5 +1,0 @@
-# settings.toml for CircuitPython WiFi
-# Place this file in the root of CIRCUITPY
-
-CIRCUITPY_WIFI_SSID = "Vinnys Bar Guest"
-CIRCUITPY_WIFI_PASSWORD = "Vinnys.Wifi.303"
