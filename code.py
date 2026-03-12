@@ -15,6 +15,8 @@ import adafruit_touchscreen
 import adafruit_requests
 import adafruit_connection_manager
 import adafruit_display_text.label as label
+from adafruit_bitmap_font import bitmap_font
+import pwmio
 from digitalio import DigitalInOut
 from adafruit_esp32spi import adafruit_esp32spi
 
@@ -122,6 +124,31 @@ def get_stockholm_time():
         return None, None, None, None
 
 
+MONTH_NAMES = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+
+def _parse_utc_offset_seconds(offset_str):
+    # Expects +HH:MM or -HH:MM
+    sign = 1 if offset_str[0] == "+" else -1
+    hours = int(offset_str[1:3])
+    minutes = int(offset_str[4:6])
+    return sign * (hours * 3600 + minutes * 60)
+
+
+def sync_stockholm_epoch():
+    data = get_json_with_retry("http://time.now/developer/api/timezone/Europe/stockholm")
+    utc_epoch = int(data["unixtime"])
+    offset_seconds = _parse_utc_offset_seconds(data.get("utc_offset", "+00:00"))
+    # local_epoch is Stockholm wall-clock time represented as epoch-like seconds.
+    return utc_epoch + offset_seconds, offset_seconds
+
+
+def stockholm_components_from_epoch(local_epoch):
+    tm = time.localtime(local_epoch)
+    month_short = MONTH_NAMES[tm.tm_mon - 1]
+    return tm.tm_hour, tm.tm_min, tm.tm_mday, month_short
+
+
 CACHED_NOW_ISO = fetch_current_time_iso()
 
 
@@ -135,6 +162,12 @@ GOOGLE_CALENDAR_IDS = [
     "q53iida61vbpa37ft4lgeul80k@group.calendar.google.com",
 ]
 
+CALENDAR_COLORS = {
+    "axel.mansson@skola.malmo.se": 0x7FDBFF,  # light blue
+    "axel.magnus.mansson@gmail.com": 0xFF6347,  # tomato red
+    "q53iida61vbpa37ft4lgeul80k@group.calendar.google.com": 0xFFB347,  # orange (Felix & Rufus)
+}
+
 
 def get_calendar_events_api_url(calendar_id):
     # Calendar ID must be URL encoded when used in the path segment.
@@ -144,6 +177,10 @@ def get_calendar_events_api_url(calendar_id):
         .replace(" ", "%20")
     )
     return "https://www.googleapis.com/calendar/v3/calendars/{}/events".format(calendar_id_encoded)
+
+
+def get_calendar_color(calendar_id):
+    return CALENDAR_COLORS.get(calendar_id, 0xFFFFFF)
 
 
 def rfc3339_to_epoch(dt_str):
@@ -203,12 +240,13 @@ def get_google_access_token():
         return None
 
 
-def fetch_next_events(max_results=6):
+def fetch_next_events(max_results=8):
     access_token = get_google_access_token()
     if not access_token:
         print("No Google access token")
         return []
     try:
+        alarm_utc_epoch = first_event_epoch - 15 * 60
         data = get_json_with_retry("http://time.now/developer/api/timezone/Europe/stockholm")
 
         now_epoch = int(data["unixtime"])
@@ -238,7 +276,7 @@ def fetch_next_events(max_results=6):
         if time_max:
             url += "&timeMax=%s" % time_max
 
-        print("Google Calendar API URL:", url)
+        #print("Google Calendar API URL:", url)
         try:
             data = get_json_with_retry(url, headers=headers)
             #print("Calendar API response:", data)
@@ -263,6 +301,7 @@ def fetch_next_events(max_results=6):
                 if event_key in seen:
                     continue
                 seen[event_key] = event_epoch
+                event["_calendar_id"] = calendar_id
                 merged_events.append(event)
         except Exception as e:
             print("Error fetching calendar events for", calendar_id, ":", e)
@@ -278,6 +317,72 @@ def format_event_compact(event):
     start_dt = event.get("start", {}).get("dateTime", "")
     hhmm = start_dt[11:16] if len(start_dt) >= 16 else "--:--"
     return hhmm, short_summary
+
+
+def utc_epoch_to_local_hhmm(utc_epoch, offset_seconds):
+    tm = time.localtime(int(utc_epoch + offset_seconds))
+    return tm.tm_hour, tm.tm_min
+
+
+def schedule_alarm_from_events(events, offset_seconds):
+    # Alarm is 15 minutes before the first upcoming event.
+    if not events:
+        return None, None, "", None
+
+    first_event = events[0]
+    first_start_dt = first_event.get("start", {}).get("dateTime", "")
+    if not first_start_dt:
+        return None, None, "", None
+
+    first_event_epoch = rfc3339_to_epoch(first_start_dt)
+    alarm_utc_epoch = first_event_epoch - 15 * 60
+    ah, am = utc_epoch_to_local_hhmm(alarm_utc_epoch, offset_seconds)
+    alarm_text = "ALARM %02d:%02d" % (ah, am)
+
+    event_key = first_start_dt + "|" + first_event.get("summary", "")
+    return alarm_utc_epoch, first_event_epoch, alarm_text, event_key
+
+
+def run_alarm_until_touch(max_duration_seconds=30):
+    # Siren with increasing intensity. Touch stops alarm; hard stop after max_duration_seconds.
+    siren = None
+    try:
+        siren = pwmio.PWMOut(board.A0, frequency=900, duty_cycle=0, variable_frequency=True)
+        duty = 3000
+        freq = 700
+        freq_up = True
+        start_t = time.monotonic()
+        while True:
+            if ts.touch_point:
+                break
+            if (time.monotonic() - start_t) >= max_duration_seconds:
+                break
+
+            siren.frequency = freq
+            siren.duty_cycle = min(65535, duty)
+            time.sleep(0.03)
+
+            if freq_up:
+                freq += 35
+                if freq >= 1400:
+                    freq_up = False
+            else:
+                freq -= 35
+                if freq <= 700:
+                    freq_up = True
+
+            if duty < 52000:
+                duty += 350
+
+            if ts.touch_point:
+                break
+
+        siren.duty_cycle = 0
+    except Exception as e:
+        print("Alarm siren error:", e)
+    finally:
+        if siren:
+            siren.deinit()
 
 
 # --- Hardware UI/audio setup ---
@@ -296,32 +401,62 @@ speaker_enable.value = True
 
 board.DISPLAY.auto_refresh = True
 
+FONT_IDLE_PATH = "/fonts/Nasalization-Regular-40.bdf"
+FONT_MAIN_PATH = "/fonts/Nasalization-Regular-20.bdf"
+
+try:
+    idle_font = bitmap_font.load_font(FONT_IDLE_PATH)
+    main_font = bitmap_font.load_font(FONT_MAIN_PATH)
+except Exception as e:
+    print("Font load failed, using terminal font:", e)
+    idle_font = terminalio.FONT
+    main_font = terminalio.FONT
+
+# Main-screen clock must use a font that has ':' glyph.
+clock_font = terminalio.FONT
+
 # Idle (bouncing) screen group
 idle_group = displayio.Group()
-idle_time_label = label.Label(terminalio.FONT, text="--:--", color=0xFFFFFF, scale=5)
-idle_date_label = label.Label(terminalio.FONT, text="-- ---", color=0xC0C0C0, scale=2)
+idle_time_label = label.Label(idle_font, text="--:--", color=0xFFFFFF)
+idle_date_label = label.Label(main_font, text="-- ---", color=0xC0C0C0)
+idle_alarm_label = label.Label(main_font, text="ALARM --:--", color=0xFFD27F)
 idle_group.append(idle_time_label)
 idle_group.append(idle_date_label)
+idle_group.append(idle_alarm_label)
 
 # Events screen group
 events_group = displayio.Group()
-events_header = label.Label(terminalio.FONT, text="UP NEXT", color=0x80FFFF, scale=1)
+events_header = label.Label(main_font, text="UP NEXT", color=0x80FFFF)
 events_header.x = 6
 events_header.y = 8
 events_group.append(events_header)
 
-event_labels = []
-for i in range(6):
-    lbl = label.Label(terminalio.FONT, text="", color=0xFFFFFF, scale=1)
-    lbl.x = 6
-    lbl.y = 24 + i * 18
-    events_group.append(lbl)
-    event_labels.append(lbl)
+EVENT_TIME_X = 6
+EVENT_TITLE_X = 65
 
-events_time_label = label.Label(terminalio.FONT, text="--:--", color=0xFFFFFF, scale=3)
-events_date_label = label.Label(terminalio.FONT, text="-- ---", color=0xC0C0C0, scale=2)
+event_time_labels = []
+event_title_labels = []
+for i in range(6):
+    row_y = 24 + i * 16
+
+    time_lbl = label.Label(main_font, text="", color=0x80FFFF)
+    time_lbl.x = EVENT_TIME_X
+    time_lbl.y = row_y
+    events_group.append(time_lbl)
+    event_time_labels.append(time_lbl)
+
+    title_lbl = label.Label(main_font, text="", color=0xFFFFFF)
+    title_lbl.x = EVENT_TITLE_X
+    title_lbl.y = row_y
+    events_group.append(title_lbl)
+    event_title_labels.append(title_lbl)
+
+events_time_label = label.Label(idle_font, text="--:--", color=0xFFFFFF)
+events_date_label = label.Label(main_font, text="-- ---", color=0xC0C0C0)
+events_alarm_label = label.Label(main_font, text="ALARM --:--", color=0xFFD27F)
 events_group.append(events_time_label)
 events_group.append(events_date_label)
+events_group.append(events_alarm_label)
 
 board.DISPLAY.root_group = idle_group
 
@@ -339,15 +474,15 @@ def update_idle_labels(hour, minute, day, month_short):
     global max_x, max_y
     idle_time_label.text = "%02d:%02d" % (hour, minute)
     idle_date_label.text = "%02d %s" % (day, month_short)
+    idle_alarm_label.text = alarm_text if alarm_text else ""
     block_w = max(
         idle_time_label.bounding_box[2] * idle_time_label.scale,
         idle_date_label.bounding_box[2] * idle_date_label.scale,
+        (idle_alarm_label.bounding_box[2] * idle_alarm_label.scale) if alarm_text else 0,
     )
-    block_h = (
-        idle_time_label.bounding_box[3] * idle_time_label.scale
-        + 6
-        + idle_date_label.bounding_box[3] * idle_date_label.scale
-    )
+    block_h = idle_time_label.bounding_box[3] * idle_time_label.scale + 6 + idle_date_label.bounding_box[3] * idle_date_label.scale
+    if alarm_text:
+        block_h += 6 + idle_alarm_label.bounding_box[3] * idle_alarm_label.scale
     max_x = board.DISPLAY.width - block_w
     max_y = board.DISPLAY.height - block_h
 
@@ -357,6 +492,9 @@ def set_idle_position(px, py):
     idle_time_label.y = int(py)
     idle_date_label.x = int(px)
     idle_date_label.y = int(py + idle_time_label.bounding_box[3] * idle_time_label.scale + 6)
+    if alarm_text:
+        idle_alarm_label.x = int(px)
+        idle_alarm_label.y = int(idle_date_label.y + idle_date_label.bounding_box[3] * idle_date_label.scale + 6)
 
 
 def bounce_idle_labels():
@@ -375,17 +513,36 @@ def bounce_idle_labels():
 def update_events_panel(events, hour, minute, day, month_short):
     events_time_label.text = "%02d:%02d" % (hour, minute)
     events_date_label.text = "%02d %s" % (day, month_short)
-    right_align(events_time_label, margin=6)
-    right_align(events_date_label, margin=6)
-    events_time_label.y = 24
-    events_date_label.y = 24 + events_time_label.bounding_box[3] * events_time_label.scale + 6
+    events_alarm_label.text = alarm_text if alarm_text else ""
+    left_margin = 6
+    bottom_margin = 8
+    row_gap = 6
 
-    for i, lbl in enumerate(event_labels):
+    # Keep one extra row reserved below date for alarm row when active.
+    time_h = events_time_label.bounding_box[3] * events_time_label.scale
+    date_h = events_date_label.bounding_box[3] * events_date_label.scale
+    reserved_h = date_h if alarm_text else 0
+
+    block_top = board.DISPLAY.height - (time_h + row_gap + date_h + row_gap + reserved_h) - bottom_margin
+    events_time_label.x = left_margin
+    events_time_label.y = int(block_top)
+    events_date_label.x = left_margin
+    events_date_label.y = int(block_top + time_h + row_gap)
+    if alarm_text:
+        events_alarm_label.x = left_margin
+        events_alarm_label.y = int(events_date_label.y + date_h + row_gap)
+
+    for i in range(6):
         if i < len(events):
             hhmm, short_summary = format_event_compact(events[i])
-            lbl.text = "%s %s" % (hhmm, short_summary)
+            row_color = get_calendar_color(events[i].get("_calendar_id"))
+            event_time_labels[i].text = hhmm
+            event_title_labels[i].text = short_summary
+            event_time_labels[i].color = row_color
+            event_title_labels[i].color = row_color
         else:
-            lbl.text = ""
+            event_time_labels[i].text = ""
+            event_title_labels[i].text = ""
 
 
 def play_wav(filename):
@@ -412,13 +569,30 @@ def say_time(hour, minute):
 # --- Startup calendar fetch ---
 events = fetch_next_events()
 
+current_utc_offset_seconds = _parse_utc_offset_seconds("+00:00")
+alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
+    events, current_utc_offset_seconds
+)
+alarm_fired_for_key = None
+
 for event in events:
     hhmm, short_summary = format_event_compact(event)
     print("-", hhmm, short_summary)
 
+print("Alarm:", alarm_text)
+
+
+def prime_events_view(hour, minute, day, month_short):
+    # Pre-populate labels so first touch does not pay all text layout/render cost.
+    update_events_panel(events, hour, minute, day, month_short)
+
 
 # --- Main loop ---
-last_time_update = 0
+TIME_SYNC_INTERVAL = 30 * 60  # 15 min: good balance between drift correction and network load.
+last_time_sync = 0
+clock_base_monotonic = None
+clock_base_local_epoch = None
+current_utc_offset_seconds = _parse_utc_offset_seconds("+00:00")
 current_hour = None
 current_minute = None
 current_day = None
@@ -427,24 +601,55 @@ events_mode_until = 0
 
 while True:
     now = time.monotonic()
-    if (current_hour is None) or (now - last_time_update > 600):
-        hour, minute, day, month_short = get_stockholm_time()
-        if hour is not None:
-            current_hour = hour
-            current_minute = minute
-            current_day = day
-            current_month_short = month_short
-            update_idle_labels(hour, minute, day, month_short)
-        last_time_update = now
+    if (clock_base_local_epoch is None) or (now - last_time_sync > TIME_SYNC_INTERVAL):
+        try:
+            clock_base_local_epoch, current_utc_offset_seconds = sync_stockholm_epoch()
+            clock_base_monotonic = now
+            last_time_sync = now
+            # Refresh alarm display/time against latest offset.
+            prev_key = alarm_event_key
+            alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
+                events, current_utc_offset_seconds
+            )
+            if alarm_event_key != prev_key:
+                alarm_fired_for_key = None
+        except Exception as e:
+            print("Time sync failed:", e)
+
+    if (clock_base_local_epoch is not None) and (clock_base_monotonic is not None):
+        elapsed = int(now - clock_base_monotonic)
+        current_local_epoch = clock_base_local_epoch + elapsed
+        current_utc_epoch = current_local_epoch - current_utc_offset_seconds
+        current_hour, current_minute, current_day, current_month_short = stockholm_components_from_epoch(current_local_epoch)
+
+        # Trigger alarm once when entering alarm window for first event.
+        if (
+            alarm_utc_epoch is not None
+            and alarm_event_utc_epoch is not None
+            and current_utc_epoch >= alarm_utc_epoch
+            and current_utc_epoch < alarm_event_utc_epoch
+            and alarm_event_key is not None
+            and alarm_fired_for_key != alarm_event_key
+        ):
+            board.DISPLAY.root_group = events_group
+            update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
+            run_alarm_until_touch()
+            alarm_fired_for_key = alarm_event_key
+            say_time(current_hour, current_minute)
+
+    # One-time warmup of events panel once we have valid time/date.
+    if current_hour is not None and events_mode_until == 0:
+        prime_events_view(current_hour, current_minute, current_day, current_month_short)
+        events_mode_until = -1
 
     if current_hour is not None:
         update_idle_labels(current_hour, current_minute, current_day, current_month_short)
 
     p = ts.touch_point
     if p and current_hour is not None:
-        say_time(current_hour, current_minute)
         update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
         board.DISPLAY.root_group = events_group
+        say_time(current_hour, current_minute)
         events_mode_until = now + 12
         time.sleep(1)
 
