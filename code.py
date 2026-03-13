@@ -225,7 +225,7 @@ def fetch_malmo_weather_lines():
             if stop_precip_hour is None and last_rain_hour is not None:
                 stop_precip_hour = (last_rain_hour + 1) % 24
             if stop_precip_hour is not None:
-                precip_start_line = "%.0f mm between %d-%d" % (precip_sum, first_precip_hour, stop_precip_hour)
+                precip_start_line = "%.0f mm: %02d-%02d" % (precip_sum, first_precip_hour, stop_precip_hour)
 
         return (
             "Hi: %d\u00b0c Lo: %d\u00b0c" % (hi_c, lo_c),
@@ -251,7 +251,7 @@ GOOGLE_CALENDAR_IDS = [
 ]
 
 CALENDAR_COLORS = {
-    "axel.mansson@skola.malmo.se": 0x7FDBFF,  # light blue
+    "axel.mansson@skola.malmo.se": 0x9F59B8,  # purple
     "axel.magnus.mansson@gmail.com": 0xFF6347,  # tomato red
     "q53iida61vbpa37ft4lgeul80k@group.calendar.google.com": 0xFFB347,  # orange (Felix & Rufus)
 }
@@ -326,7 +326,7 @@ def get_google_access_token():
         return None
 
 
-def fetch_next_events(max_results=8):
+def fetch_next_events(max_results=7):
     global pappavecka_active, pappavecka_date, mammavecka_active, mammavecka_date
     access_token = get_google_access_token()
     if not access_token:
@@ -409,17 +409,41 @@ def fetch_next_events(max_results=8):
 
 
 def format_event_compact(event):
+    max_chars = 19
     summary = event.get("summary", "(No title)")
     words = summary.split()
-    short_summary = " ".join(words[:2]) if words else "(No title)"
+    if words:
+        short_summary = ""
+        for word in words:
+            candidate = word if not short_summary else (short_summary + " " + word)
+            if len(candidate) <= max_chars:
+                short_summary = candidate
+            else:
+                break
+        # Keep whole words only; if first word is longer than cap, keep it as-is.
+        if not short_summary:
+            short_summary = words[0]
+    else:
+        short_summary = "(No title)"
     start_dt = event.get("start", {}).get("dateTime", "")
     if len(start_dt) >= 16:
         hh = int(start_dt[11:13])
         mm = start_dt[14:16]
-        hhmm = "00:%s" % mm if hh == 0 else "%d:%s" % (hh, mm)
+        hhmm = "%d:%s" % (hh, mm)
     else:
         hhmm = "--:--"
     return hhmm, short_summary
+
+
+def log_main_screen_events(events):
+    shown = min(len(events), EVENT_ROWS)
+    print("Events in 24h:", len(events), "shown on screen:", shown, "row cap:", EVENT_ROWS)
+    if shown == 0:
+        print("- none")
+        return
+    for i in range(shown):
+        hhmm, short_summary = format_event_compact(events[i])
+        print("-", hhmm, short_summary)
 
 
 def utc_epoch_to_local_hhmm(utc_epoch, offset_seconds):
@@ -820,7 +844,10 @@ idle_weather_line1 = label.Label(weather_font, text="Hi: --\u00b0c Lo: --\u00b0c
 idle_weather_line2 = label.Label(weather_font, text="Weather", color=0xBFE8FF)
 idle_weather_line3 = label.Label(weather_font, text="Sun: --:-- - --:--", color=0xBFE8FF)
 idle_weather_line4 = label.Label(weather_font, text="", color=0xBFE8FF)
-WEATHER_Y_EXTRA = 5
+WEATHER_Y_EXTRA = 0
+PRECIP_ROW_Y_ADJUST = -10
+SUN_ROW_Y_ADJUST = 5
+ALARM_LABEL_Y_ADJUST = -5
 
 # Startup placement: center placeholder idle labels before first network sync.
 startup_alarm_w = idle_alarm_label.bounding_box[2] * idle_alarm_label.scale
@@ -855,14 +882,14 @@ idle_time_label.y = startup_y
 idle_date_label.x = startup_x + startup_time_w + 10
 idle_date_label.y = startup_y + (startup_row1_h - startup_date_h) // 2
 idle_alarm_label.x = startup_x
-idle_alarm_label.y = startup_y + startup_row1_h + 6
-startup_next_y = idle_alarm_label.y + startup_alarm_h + 6
+idle_alarm_label.y = startup_y + startup_row1_h + 6 + ALARM_LABEL_Y_ADJUST
+startup_next_y = startup_y + startup_row1_h + 6 + startup_alarm_h + 6
 idle_weather_line1.x = startup_x
 idle_weather_line1.y = startup_next_y + WEATHER_Y_EXTRA
 idle_weather_line2.x = startup_x
 idle_weather_line2.y = idle_weather_line1.y + idle_weather_line1.bounding_box[3] * idle_weather_line1.scale + 4
 idle_weather_line3.x = startup_x
-idle_weather_line3.y = idle_weather_line2.y + idle_weather_line2.bounding_box[3] * idle_weather_line2.scale + 4
+idle_weather_line3.y = idle_weather_line2.y + idle_weather_line2.bounding_box[3] * idle_weather_line2.scale + 4 + SUN_ROW_Y_ADJUST
 idle_weather_line4.x = startup_x
 idle_weather_line4.y = idle_weather_line3.y + idle_weather_line3.bounding_box[3] * idle_weather_line3.scale + 4
 
@@ -884,9 +911,9 @@ events_group.append(events_header)
 EVENT_TIME_X = 6
 EVENT_TITLE_X = 66
 EVENT_TIME_RIGHT_X = EVENT_TITLE_X - 6
-EVENT_ROWS = 8
+EVENT_ROWS = 7
 EVENT_ROW_START_Y = 29
-EVENT_ROW_GAP = 16
+EVENT_ROW_GAP = 20
 
 event_time_labels = []
 event_title_labels = []
@@ -1017,9 +1044,10 @@ def update_idle_labels(hour, minute, day, month_short):
     block_h += WEATHER_Y_EXTRA
     block_h += 6 + idle_weather_line1.bounding_box[3] * idle_weather_line1.scale
     block_h += 4 + idle_weather_line2.bounding_box[3] * idle_weather_line2.scale
-    block_h += 4 + idle_weather_line3.bounding_box[3] * idle_weather_line3.scale
+    block_h += (4 + (PRECIP_ROW_Y_ADJUST if idle_weather_line4.text else 0)) + idle_weather_line3.bounding_box[3] * idle_weather_line3.scale
     if idle_weather_line4.text:
         block_h += 4 + idle_weather_line4.bounding_box[3] * idle_weather_line4.scale
+    block_h += SUN_ROW_Y_ADJUST
     max_x = max(IDLE_MIN_X, board.DISPLAY.width - block_w)
     max_y = max(IDLE_MIN_Y, board.DISPLAY.height - block_h)
     x = min(max(x, IDLE_MIN_X), max_x)
@@ -1039,19 +1067,20 @@ def set_idle_position(px, py):
     next_y = int(py + row1_h + 6)
     if alarm_text:
         idle_alarm_label.x = int(px)
-        idle_alarm_label.y = int(next_y)
-        next_y = int(idle_alarm_label.y + idle_alarm_label.bounding_box[3] * idle_alarm_label.scale + 6)
+        idle_alarm_label.y = int(next_y + ALARM_LABEL_Y_ADJUST)
+        next_y = int(next_y + idle_alarm_label.bounding_box[3] * idle_alarm_label.scale + 6)
     else:
         idle_alarm_label.x = int(px)
-        idle_alarm_label.y = int(next_y)
+        idle_alarm_label.y = int(next_y + ALARM_LABEL_Y_ADJUST)
     idle_weather_line1.x = int(px)
     idle_weather_line1.y = int(next_y + WEATHER_Y_EXTRA)
     idle_weather_line2.x = int(px)
     idle_weather_line2.y = int(idle_weather_line1.y + idle_weather_line1.bounding_box[3] * idle_weather_line1.scale + 4)
     idle_weather_line3.x = int(px)
-    idle_weather_line3.y = int(idle_weather_line2.y + idle_weather_line2.bounding_box[3] * idle_weather_line2.scale + 4)
+    line3_gap = 4 + (PRECIP_ROW_Y_ADJUST if weather_line4 else 0)
+    idle_weather_line3.y = int(idle_weather_line2.y + idle_weather_line2.bounding_box[3] * idle_weather_line2.scale + line3_gap + (0 if weather_line4 else SUN_ROW_Y_ADJUST))
     idle_weather_line4.x = int(px)
-    idle_weather_line4.y = int(idle_weather_line3.y + idle_weather_line3.bounding_box[3] * idle_weather_line3.scale + 4)
+    idle_weather_line4.y = int(idle_weather_line3.y + idle_weather_line3.bounding_box[3] * idle_weather_line3.scale + 4 + (SUN_ROW_Y_ADJUST if weather_line4 else 0))
 
 
 def bounce_idle_labels():
@@ -1089,9 +1118,9 @@ def update_events_panel(events, hour, minute, day, month_short):
 
     block_top = board.DISPLAY.height - (time_h + row_gap + date_h + row_gap + reserved_h) - bottom_margin
     events_time_label.x = left_margin
-    events_time_label.y = int(block_top)
+    events_time_label.y = int(block_top + 7)
     events_date_label.x = left_margin
-    events_date_label.y = int(block_top + time_h + row_gap)
+    events_date_label.y = int(block_top + time_h + row_gap + 1)
     if alarm_text:
         events_alarm_label.x = left_margin
         events_alarm_label.y = int(events_date_label.y + date_h + row_gap)
@@ -1141,6 +1170,7 @@ def say_time(hour, minute):
 
 # --- Startup calendar fetch ---
 events = fetch_next_events()
+log_main_screen_events(events)
 weather_line1, weather_line2, weather_line3, weather_line4 = fetch_malmo_weather_lines()
 
 current_utc_offset_seconds = _parse_utc_offset_seconds("+00:00")
@@ -1187,6 +1217,7 @@ while True:
                 weather_line4,
             ) = sync_time_and_forecast()
             events = fetch_next_events()
+            log_main_screen_events(events)
             clock_base_monotonic = now
             last_time_sync = now
             sync_reposition_pending = True
