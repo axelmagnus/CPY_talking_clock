@@ -50,22 +50,17 @@ requests = adafruit_requests.Session(pool, ssl_context)
 while not esp.is_connected:
     try:
         esp.connect_AP(ssid, password)
-    except OSError as e:
-        print("could not connect to AP, retrying:", e)
+    except OSError:
         continue
-
-print("Connected! IP address:", esp.pretty_ip(esp.ip_address))
 
 
 def ensure_wifi_connected():
     if esp.is_connected:
         return
-    print("WiFi disconnected, reconnecting...")
     while not esp.is_connected:
         try:
             esp.connect_AP(ssid, password)
-        except OSError as e:
-            print("Reconnect failed, retrying:", e)
+        except OSError:
             time.sleep(1)
 
 
@@ -81,7 +76,6 @@ def get_json_with_retry(url, headers=None, retries=3):
             return data
         except Exception as e:
             last_error = e
-            print("GET retry", attempt + 1, "failed:", e)
             # Recreate session to recover from socket/SSL parser glitches.
             requests = adafruit_requests.Session(pool, ssl_context)
             time.sleep(1)
@@ -98,7 +92,6 @@ def post_form_with_retry(url, data, headers=None, retries=3):
             return resp
         except Exception as e:
             last_error = e
-            print("POST retry", attempt + 1, "failed:", e)
             requests = adafruit_requests.Session(pool, ssl_context)
             time.sleep(1)
     raise last_error
@@ -110,15 +103,12 @@ def fetch_current_time_iso():
     try:
         data = get_json_with_retry("http://time.now/developer/api/timezone/Europe/stockholm")
         now_iso = data["utc_datetime"].split(".")[0] + "Z"
-        print("Current UTC time from time.now API:", now_iso)
         return now_iso
-    except Exception as e:
-        print("Error fetching current time from time.now API:", e)
+    except Exception:
         now = time.localtime()
         now_iso = "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}Z".format(
             now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec
         )
-        print("Fallback UTC time from device:", now_iso)
         return now_iso
 
 
@@ -132,8 +122,7 @@ def get_stockholm_time():
         month_names = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
         month_short = month_names[int(month) - 1]
         return int(hour), int(minute), int(day), month_short
-    except Exception as e:
-        print("Errors fetching time:", e)
+    except Exception:
         return None, None, None, None
 
 
@@ -236,7 +225,7 @@ def fetch_malmo_weather_lines():
             if stop_precip_hour is None and last_rain_hour is not None:
                 stop_precip_hour = (last_rain_hour + 1) % 24
             if stop_precip_hour is not None:
-                precip_start_line = "between %d-%d %.0f mm" % (first_precip_hour, stop_precip_hour, precip_sum)
+                precip_start_line = "%.0f mm between %d-%d" % (precip_sum, first_precip_hour, stop_precip_hour)
 
         return (
             "Hi: %d\u00b0c Lo: %d\u00b0c" % (hi_c, lo_c),
@@ -244,8 +233,7 @@ def fetch_malmo_weather_lines():
             "Sun: %s - %s" % (sunrise_hhmm, sunset_hhmm),
             precip_start_line,
         )
-    except Exception as e:
-        print("Weather fetch failed:", e)
+    except Exception:
         return "Hi: --\u00b0c Lo: --\u00b0c", "Weather", "Sun: --:-- - --:--", ""
 
 
@@ -332,11 +320,9 @@ def get_google_access_token():
             token_data = resp.json()
             resp.close()
             return token_data.get("access_token")
-        print("Failed to get access token:", resp.text)
         resp.close()
         return None
-    except Exception as e:
-        print("Direct POST error:", e)
+    except Exception:
         return None
 
 
@@ -344,7 +330,6 @@ def fetch_next_events(max_results=8):
     global pappavecka_active, pappavecka_date, mammavecka_active, mammavecka_date
     access_token = get_google_access_token()
     if not access_token:
-        print("No Google access token")
         return []
     try:
         data = get_json_with_retry("http://time.now/developer/api/timezone/Europe/stockholm")
@@ -354,10 +339,7 @@ def fetch_next_events(max_results=8):
         time_min = epoch_to_utc_iso(now_epoch)
         time_max = epoch_to_utc_iso(max_epoch)
 
-        print("Using timeMin (now, UTC):", time_min)
-        print("Using timeMax (24h ahead, UTC):", time_max)
-    except Exception as e:
-        print("Error fetching UTC time for calendar:", e)
+    except Exception:
         now_epoch = None
         max_epoch = None
         time_min = CACHED_NOW_ISO
@@ -380,10 +362,8 @@ def fetch_next_events(max_results=8):
         if time_max:
             url += "&timeMax=%s" % time_max
 
-        #print("Google Calendar API URL:", url)
         try:
             data = get_json_with_retry(url, headers=headers)
-            #print("Calendar API response:", data)
             for event in data.get("items", []):
                 start = event.get("start", {})
                 summary = event.get("summary", "").strip()
@@ -421,8 +401,8 @@ def fetch_next_events(max_results=8):
                 seen[event_key] = event_epoch
                 event["_calendar_id"] = calendar_id
                 merged_events.append(event)
-        except Exception as e:
-            print("Error fetching calendar events for", calendar_id, ":", e)
+        except Exception:
+            pass
 
     merged_events.sort(key=lambda event: seen.get(event.get("start", {}).get("dateTime", "") + "|" + event.get("summary", ""), 0))
     return merged_events[:max_results]
@@ -497,28 +477,10 @@ def _is_pappavecka_extra_alarm_date(date_str):
     return date_str in extra_dates
 
 
-MORNING_LIMIT_HOUR = 10  # Only first events before this hour get event alarms.
-DEBUG_ALARM_SCHEDULER = False
-
-
-def _format_local_stamp_from_utc(utc_epoch, offset_seconds):
-    hh, mm, dd, mon = stockholm_components_from_epoch(utc_epoch + offset_seconds)
-    return "%02d:%02d %02d %s" % (hh, mm, dd, mon)
-
-
-def _log_alarm_decision(candidates, selected, offset_seconds, now_utc_epoch):
-    if not DEBUG_ALARM_SCHEDULER:
-        return
-    if now_utc_epoch is None:
-        print("Alarm scheduler now: unknown")
-    else:
-        print("Alarm scheduler now:", _format_local_stamp_from_utc(now_utc_epoch, offset_seconds))
-    for alarm_utc_epoch, _event_utc_epoch, alarm_text_cand, event_key_cand in sorted(candidates, key=lambda c: c[0]):
-        print("Alarm cand:", alarm_text_cand, event_key_cand, "at", _format_local_stamp_from_utc(alarm_utc_epoch, offset_seconds))
-    if selected is None:
-        print("Alarm selected: none")
-    else:
-        print("Alarm selected:", selected[2], selected[3], "at", _format_local_stamp_from_utc(selected[0], offset_seconds))
+MORNING_LIMIT_HOUR = 10  # Weekday first-event alarms before this hour.
+WEEKEND_MORNING_LIMIT_HOUR = 11  # Weekend first-event alarms before this hour.
+WEEKDAY_EVENT_ALARM_LEAD_MINUTES = 15
+WEEKEND_EVENT_ALARM_LEAD_MINUTES = 30
 
 
 def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
@@ -566,10 +528,8 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
 
             local_tm = time.localtime(int(event_utc_epoch + offset_seconds))
             local_date = "%04d-%02d-%02d" % (local_tm.tm_year, local_tm.tm_mon, local_tm.tm_mday)
-            if local_tm.tm_wday >= 5:
-                # Weekend morning events do not get alarm scheduling.
-                continue
-            if local_tm.tm_hour >= MORNING_LIMIT_HOUR:
+            limit_hour = WEEKEND_MORNING_LIMIT_HOUR if local_tm.tm_wday >= 5 else MORNING_LIMIT_HOUR
+            if local_tm.tm_hour >= limit_hour:
                 continue
 
             current = first_morning_event_by_date.get(local_date)
@@ -581,7 +541,8 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
                 # After the first morning event has started, no more event alarm this day.
                 continue
 
-            event_alarm_utc_epoch = first_event_epoch - 15 * 60
+            lead_minutes = WEEKEND_EVENT_ALARM_LEAD_MINUTES if time.localtime(int(first_event_epoch + offset_seconds)).tm_wday >= 5 else WEEKDAY_EVENT_ALARM_LEAD_MINUTES
+            event_alarm_utc_epoch = first_event_epoch - (lead_minutes * 60)
             event_key = first_start_dt + "|" + first_event.get("summary", "")
             ah, am = utc_epoch_to_local_hhmm(event_alarm_utc_epoch, offset_seconds)
             candidates.append(
@@ -625,18 +586,15 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
                     )
 
     if not candidates:
-        _log_alarm_decision(candidates, None, offset_seconds, now_utc_epoch)
         return None, None, "", None
 
     candidates.sort(key=lambda c: c[0])
     selected = candidates[0]
-    _log_alarm_decision(candidates, selected, offset_seconds, now_utc_epoch)
     return selected
 
 
 def _open_speaker_audio_out():
     if not SYNTH_SIREN_AVAILABLE:
-        print("Alarm synth module unavailable (need synthio)")
         return None
 
     # First try DAC path (AudioOut), which matches the working speech path on PyPortal.
@@ -646,10 +604,9 @@ def _open_speaker_audio_out():
         pin = getattr(board, pin_name)
         try:
             audio = audioio.AudioOut(pin)
-            print("Alarm audio output: audioio.AudioOut on", pin_name)
             return audio
-        except Exception as e:
-            print("Alarm audio output failed: audioio", pin_name, e)
+        except Exception:
+            pass
 
     # Fall back to PWM audio where available.
     if audiopwmio is None:
@@ -662,17 +619,15 @@ def _open_speaker_audio_out():
         pin = getattr(board, pin_name)
         try:
             audio = audiopwmio.PWMAudioOut(pin)
-            print("Alarm audio output: audiopwmio.PWMAudioOut on", pin_name)
             return audio
-        except Exception as e:
-            print("Alarm audio output failed: audiopwmio", pin_name, e)
+        except Exception:
+            pass
     return None
 
 
 def run_alarm_until_touch(max_duration_seconds=30):
     # Gentle Bach-style wake phrase. Touch stops alarm; hard stop after max_duration_seconds.
     if not SYNTH_SIREN_AVAILABLE:
-        print("Synth alarm error: synthio not available")
         return
 
     audio = None
@@ -681,7 +636,6 @@ def run_alarm_until_touch(max_duration_seconds=30):
     try:
         audio = _open_speaker_audio_out()
         if audio is None:
-            print("Synth alarm error: no usable audio pin")
             return
         env = synthio.Envelope(
             attack_time=0.01,
@@ -759,17 +713,15 @@ def run_alarm_until_touch(max_duration_seconds=30):
             except Exception:
                 pass
         audio.stop()
-    except Exception as e:
-        print("Synth alarm error:", e)
+    except Exception:
+        pass
     finally:
         if audio:
             audio.deinit()
 
 
 def run_pwm_alarm_self_test(duration_seconds=2.0):
-    print("Synth alarm self-test: start")
     if not SYNTH_SIREN_AVAILABLE:
-        print("Synth alarm self-test failed: synthio not available")
         return
 
     audio = None
@@ -778,7 +730,6 @@ def run_pwm_alarm_self_test(duration_seconds=2.0):
     try:
         audio = _open_speaker_audio_out()
         if audio is None:
-            print("Synth alarm self-test failed: no usable audio pin")
             return
         env = synthio.Envelope(
             attack_time=0.01,
@@ -818,9 +769,8 @@ def run_pwm_alarm_self_test(duration_seconds=2.0):
             except Exception:
                 pass
         audio.stop()
-        print("Synth alarm self-test: done")
-    except Exception as e:
-        print("Synth alarm self-test failed:", e)
+    except Exception:
+        pass
     finally:
         if audio:
             audio.deinit()
@@ -853,8 +803,7 @@ try:
     idle_font = bitmap_font.load_font(FONT_IDLE_PATH)
     main_font = bitmap_font.load_font(FONT_MAIN_PATH)
     weather_font = bitmap_font.load_font(FONT_WEATHER_PATH)
-except Exception as e:
-    print("Font load failed, using terminal font:", e)
+except Exception:
     idle_font = terminalio.FONT
     main_font = terminalio.FONT
     weather_font = terminalio.FONT
@@ -1175,8 +1124,8 @@ def play_wav(filename):
                 audio.play(wav)
                 while audio.playing:
                     pass
-    except Exception as e:
-        print("Error playing", filename, e)
+    except Exception:
+        pass
 
 
 def say_time(hour, minute):
@@ -1249,8 +1198,8 @@ while True:
             )
             if alarm_event_key != prev_key:
                 alarm_fired_for_key = None
-        except Exception as e:
-            print("Time sync failed:", e)
+        except Exception:
+            pass
 
     if (clock_base_local_epoch is not None) and (clock_base_monotonic is not None):
         elapsed = int(now - clock_base_monotonic)
