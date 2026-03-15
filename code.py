@@ -12,6 +12,7 @@ import displayio
 import audioio
 import audiocore
 import terminalio
+import analogio
 import adafruit_touchscreen
 import adafruit_requests
 import adafruit_connection_manager
@@ -174,7 +175,8 @@ def fetch_malmo_weather_lines():
     url = (
         "https://api.open-meteo.com/v1/forecast"
         "?latitude=%s&longitude=%s"
-        "&daily=apparent_temperature_max,apparent_temperature_min,weather_code,precipitation_sum,sunrise,sunset"
+        "&daily=temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,weather_code,precipitation_sum,sunrise,sunset"
+        "&current=temperature_2m,apparent_temperature"
         "&hourly=precipitation"
         "&timezone=Europe%%2FStockholm&forecast_days=1&forecast_hours=24"
         % (lat, lon)
@@ -182,21 +184,31 @@ def fetch_malmo_weather_lines():
     try:
         data = get_json_with_retry(url)
         daily = data.get("daily", {})
-        hi_list = daily.get("apparent_temperature_max", [])
-        lo_list = daily.get("apparent_temperature_min", [])
+        hi_real_list = daily.get("temperature_2m_max", [])
+        lo_real_list = daily.get("temperature_2m_min", [])
+        hi_app_list = daily.get("apparent_temperature_max", [])
+        lo_app_list = daily.get("apparent_temperature_min", [])
         wmo_list = daily.get("weather_code", daily.get("weathercode", []))
         precip_sum_list = daily.get("precipitation_sum", [])
         sunrise_list = daily.get("sunrise", [])
         sunset_list = daily.get("sunset", [])
+        current = data.get("current", {})
         hourly = data.get("hourly", {})
         hourly_time_list = hourly.get("time", [])
         hourly_precip_list = hourly.get("precipitation", [])
 
-        if not hi_list or not lo_list:
-            return "Hi: --\u00b0c Lo: --\u00b0c", "Weather", "Sun: --:-- - --:--", ""
+        if not hi_real_list or not lo_real_list or not hi_app_list or not lo_app_list:
+            return "Hi: --(--) Lo: --(--)", "Weather", "Sun: --:-- - --:--", "", "--(--)"
 
-        hi_c = int(round(hi_list[0]))
-        lo_c = int(round(lo_list[0]))
+        hi_real = int(round(hi_real_list[0]))
+        lo_real = int(round(lo_real_list[0]))
+        hi_app = int(round(hi_app_list[0]))
+        lo_app = int(round(lo_app_list[0]))
+        cur_real = current.get("temperature_2m")
+        cur_app = current.get("apparent_temperature")
+        current_compact = "--(--)"
+        if cur_real is not None and cur_app is not None:
+            current_compact = "%d°(%d)" % (int(round(cur_real)), int(round(cur_app)))
         wmo_code = int(wmo_list[0]) if wmo_list else -1
         precip_sum = float(precip_sum_list[0]) if precip_sum_list else 0.0
         sunrise_hhmm = _iso_to_short_hhmm(sunrise_list[0]) if sunrise_list else "--:--"
@@ -206,14 +218,17 @@ def fetch_malmo_weather_lines():
         first_precip_hour = None
         stop_precip_hour = None
         last_rain_hour = None
+        precip_block_sum = 0.0
         for i in range(min(len(hourly_time_list), len(hourly_precip_list))):
             hour = _iso_to_hour(hourly_time_list[i])
             if hour is None:
                 continue
             try:
-                if float(hourly_precip_list[i]) > 0.0:
+                hourly_amount = float(hourly_precip_list[i])
+                if hourly_amount > 0.0:
                     if first_precip_hour is None:
                         first_precip_hour = hour
+                    precip_block_sum += hourly_amount
                     last_rain_hour = hour
                 elif first_precip_hour is not None:
                     # First dry hour after rain starts marks the stop time.
@@ -225,16 +240,18 @@ def fetch_malmo_weather_lines():
             if stop_precip_hour is None and last_rain_hour is not None:
                 stop_precip_hour = (last_rain_hour + 1) % 24
             if stop_precip_hour is not None:
-                precip_start_line = "%.0f mm: %02d-%02d" % (precip_sum, first_precip_hour, stop_precip_hour)
+                precip_amount = precip_block_sum if precip_block_sum > 0.0 else precip_sum
+                precip_start_line = "%.1f mm: %02d-%02d" % (precip_amount, first_precip_hour, stop_precip_hour)
 
         return (
-            "Hi: %d\u00b0c Lo: %d\u00b0c" % (hi_c, lo_c),
+            "Hi: %d°(%d) Lo: %d°(%d)" % (hi_real, hi_app, lo_real, lo_app),
             "%s" % (desc,),
             "Sun: %s - %s" % (sunrise_hhmm, sunset_hhmm),
             precip_start_line,
+            current_compact,
         )
     except Exception:
-        return "Hi: --\u00b0c Lo: --\u00b0c", "Weather", "Sun: --:-- - --:--", ""
+        return "Hi: --(--) Lo: --(--)", "Weather", "Sun: --:-- - --:--", "", "--(--)"
 
 
 CACHED_NOW_ISO = fetch_current_time_iso()
@@ -255,6 +272,9 @@ CALENDAR_COLORS = {
     "axel.magnus.mansson@gmail.com": 0xFF6347,  # tomato red
     "q53iida61vbpa37ft4lgeul80k@group.calendar.google.com": 0xFFB347,  # orange (Felix & Rufus)
 }
+
+DEBUG_TASKS = True
+DEBUG_CALENDAR = True
 
 
 def get_calendar_events_api_url(calendar_id):
@@ -335,7 +355,11 @@ def fetch_next_events(max_results=7):
         data = get_json_with_retry("http://time.now/developer/api/timezone/Europe/stockholm")
 
         now_epoch = int(data["unixtime"])
-        max_epoch = now_epoch + 24 * 60 * 60
+        offset_seconds = _parse_utc_offset_seconds(data.get("utc_offset", "+00:00"))
+        now_local_tm = time.localtime(now_epoch + offset_seconds)
+        # On weekends, look further ahead so Monday events are still listed.
+        lookahead_hours = 72 if now_local_tm.tm_wday >= 5 else 24
+        max_epoch = now_epoch + lookahead_hours * 60 * 60
         time_min = epoch_to_utc_iso(now_epoch)
         time_max = epoch_to_utc_iso(max_epoch)
 
@@ -364,6 +388,10 @@ def fetch_next_events(max_results=7):
 
         try:
             data = get_json_with_retry(url, headers=headers)
+            kept_for_calendar = 0
+            skipped_all_day = 0
+            skipped_window = 0
+            skipped_parse = 0
             for event in data.get("items", []):
                 start = event.get("start", {})
                 summary = event.get("summary", "").strip()
@@ -383,16 +411,19 @@ def fetch_next_events(max_results=7):
                 # Skip all other all-day events (all-day uses start.date instead of start.dateTime)
                 start_dt = start.get("dateTime")
                 if not start_dt:
+                    skipped_all_day += 1
                     continue
 
                 try:
                     event_epoch = rfc3339_to_epoch(start_dt)
                 except Exception:
+                    skipped_parse += 1
                     continue
 
                 # Enforce exact now..now+24h window in code.
                 if now_epoch is not None and max_epoch is not None:
                     if event_epoch < now_epoch or event_epoch > max_epoch:
+                        skipped_window += 1
                         continue
 
                 event_key = start_dt + "|" + event.get("summary", "")
@@ -401,6 +432,8 @@ def fetch_next_events(max_results=7):
                 seen[event_key] = event_epoch
                 event["_calendar_id"] = calendar_id
                 merged_events.append(event)
+                kept_for_calendar += 1
+
         except Exception:
             pass
 
@@ -433,6 +466,164 @@ def format_event_compact(event):
     else:
         hhmm = "--:--"
     return hhmm, short_summary
+
+
+def _compact_words(text, max_chars):
+    words = text.split()
+    if not words:
+        return ""
+    compact = ""
+    for word in words:
+        candidate = word if not compact else (compact + " " + word)
+        if len(candidate) <= max_chars:
+            compact = candidate
+        else:
+            break
+    return compact if compact else words[0]
+
+
+def _normalize_rfc3339_for_parser(dt_str):
+    # rfc3339_to_epoch expects second precision, e.g. ...:SSZ or ...:SS+HH:MM
+    if not dt_str:
+        return dt_str
+    if "." not in dt_str:
+        return dt_str
+    if dt_str.endswith("Z"):
+        return dt_str.split(".")[0] + "Z"
+    plus_idx = dt_str.find("+", 19)
+    minus_idx = dt_str.find("-", 19)
+    tz_idx = plus_idx if plus_idx != -1 else minus_idx
+    if tz_idx == -1:
+        return dt_str.split(".")[0]
+    return dt_str[:19] + dt_str[tz_idx:]
+
+
+def get_tasks_list_api_url():
+    return "https://tasks.googleapis.com/tasks/v1/users/@me/lists"
+
+
+def get_tasks_items_api_url(tasklist_id):
+    tasklist_id_encoded = (
+        tasklist_id.replace("@", "%40")
+        .replace("/", "%2F")
+        .replace(" ", "%20")
+    )
+    return "https://tasks.googleapis.com/tasks/v1/lists/{}/tasks".format(tasklist_id_encoded)
+
+
+def fetch_week_tasks(offset_seconds, now_utc_epoch, max_rows=7):
+    access_token = get_google_access_token()
+    if not access_token or now_utc_epoch is None:
+        return []
+
+    now_local_epoch = now_utc_epoch + offset_seconds
+    now_local_tm = time.localtime(now_local_epoch)
+    start_today_local_epoch = time.mktime((
+        now_local_tm.tm_year,
+        now_local_tm.tm_mon,
+        now_local_tm.tm_mday,
+        0,
+        0,
+        0,
+        0,
+        -1,
+        -1,
+    ))
+    start_week_local_epoch = start_today_local_epoch - (now_local_tm.tm_wday * 86400)
+    end_week_local_epoch = start_week_local_epoch + (7 * 86400)
+
+    headers = {"Authorization": "Bearer %s" % access_token}
+    tasks = []
+    try:
+        lists_data = get_json_with_retry(get_tasks_list_api_url(), headers=headers)
+    except Exception:
+        return []
+
+    task_lists = lists_data.get("items", [])
+
+    dropped_completed = 0
+    dropped_no_due = 0
+    dropped_bad_due = 0
+    dropped_outside_week = 0
+
+    for tasklist in task_lists:
+        tasklist_id = tasklist.get("id")
+        if not tasklist_id:
+            continue
+        url = get_tasks_items_api_url(tasklist_id) + "?showCompleted=false&showHidden=false&maxResults=100"
+        try:
+            list_data = get_json_with_retry(url, headers=headers)
+        except Exception:
+            continue
+
+        list_items = list_data.get("items", [])
+
+        for task in list_items:
+            if task.get("status") == "completed":
+                dropped_completed += 1
+                continue
+            due_raw = task.get("due")
+            if not due_raw:
+                dropped_no_due += 1
+                continue
+            due_norm = _normalize_rfc3339_for_parser(due_raw)
+            try:
+                due_utc_epoch = rfc3339_to_epoch(due_norm)
+            except Exception:
+                dropped_bad_due += 1
+                continue
+
+            due_local_epoch = due_utc_epoch + offset_seconds
+            if due_local_epoch < start_today_local_epoch or due_local_epoch >= end_week_local_epoch:
+                dropped_outside_week += 1
+                continue
+
+            tasks.append(
+                {
+                    "due_utc_epoch": due_utc_epoch,
+                    "due_local_epoch": due_local_epoch,
+                    "title": task.get("title", "(No title)").strip() or "(No title)",
+                }
+            )
+
+    tasks.sort(key=lambda t: (t["due_utc_epoch"], t["title"]))
+
+    today_tasks = []
+    rest_tasks = []
+    for task in tasks:
+        due_tm = time.localtime(task["due_local_epoch"])
+        if (
+            due_tm.tm_year == now_local_tm.tm_year
+            and due_tm.tm_mon == now_local_tm.tm_mon
+            and due_tm.tm_mday == now_local_tm.tm_mday
+        ):
+            today_tasks.append(task)
+        else:
+            rest_tasks.append(task)
+
+    rows = []
+    if today_tasks and rest_tasks:
+        if len(today_tasks) >= max_rows:
+            selected_tasks = today_tasks[:max_rows]
+            for task in selected_tasks:
+                due_tm = time.localtime(task["due_local_epoch"])
+                rows.append(("%02d/%02d" % (due_tm.tm_mday, due_tm.tm_mon), _compact_words(task["title"], 19), 0xFFFFFF))
+        else:
+            for task in today_tasks:
+                due_tm = time.localtime(task["due_local_epoch"])
+                rows.append(("%02d/%02d" % (due_tm.tm_mday, due_tm.tm_mon), _compact_words(task["title"], 19), 0xFFFFFF))
+            if len(rows) < max_rows:
+                rows.append(("", "---------", 0x909090))
+            remaining = max_rows - len(rows)
+            for task in rest_tasks[:remaining]:
+                due_tm = time.localtime(task["due_local_epoch"])
+                rows.append(("%02d/%02d" % (due_tm.tm_mday, due_tm.tm_mon), _compact_words(task["title"], 19), 0xFFFFFF))
+    else:
+        for task in (today_tasks + rest_tasks)[:max_rows]:
+            due_tm = time.localtime(task["due_local_epoch"])
+            rows.append(("%02d/%02d" % (due_tm.tm_mday, due_tm.tm_mon), _compact_words(task["title"], 19), 0xFFFFFF))
+
+    return rows
 
 
 def log_main_screen_events(events):
@@ -539,6 +730,13 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
                 )
 
     if events:
+        now_local_date = None
+        tomorrow_local_date = None
+        if now_utc_epoch is not None:
+            now_local_epoch = now_utc_epoch + offset_seconds
+            now_local_date = _local_epoch_to_date_str(now_local_epoch)
+            tomorrow_local_date = _local_epoch_to_date_str(now_local_epoch + 86400)
+
         # Build first morning event per day; ignore later daytime events.
         first_morning_event_by_date = {}
         for event in events:
@@ -552,6 +750,11 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
 
             local_tm = time.localtime(int(event_utc_epoch + offset_seconds))
             local_date = "%04d-%02d-%02d" % (local_tm.tm_year, local_tm.tm_mon, local_tm.tm_mday)
+
+            # Only arm event alarms for today/tomorrow.
+            if now_local_date is not None and local_date not in (now_local_date, tomorrow_local_date):
+                continue
+
             limit_hour = WEEKEND_MORNING_LIMIT_HOUR if local_tm.tm_wday >= 5 else MORNING_LIMIT_HOUR
             if local_tm.tm_hour >= limit_hour:
                 continue
@@ -615,6 +818,15 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
     candidates.sort(key=lambda c: c[0])
     selected = candidates[0]
     return selected
+
+
+def log_alarm_choice(alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key, offset_seconds, now_utc_epoch):
+    _ = alarm_utc_epoch
+    _ = alarm_event_utc_epoch
+    _ = alarm_text
+    _ = alarm_event_key
+    _ = offset_seconds
+    _ = now_utc_epoch
 
 
 def _open_speaker_audio_out():
@@ -810,6 +1022,11 @@ ts = adafruit_touchscreen.Touchscreen(
     size=(320, 240),
 )
 
+try:
+    light_sensor = analogio.AnalogIn(board.LIGHT)
+except Exception:
+    light_sensor = None
+
 speaker_enable = digitalio.DigitalInOut(board.SPEAKER_ENABLE)
 speaker_enable.direction = digitalio.Direction.OUTPUT
 speaker_enable.value = True
@@ -840,7 +1057,7 @@ idle_group = displayio.Group()
 idle_time_label = label.Label(idle_font, text="--:--", color=0xFFFFFF)
 idle_date_label = label.Label(main_font, text="-- ---", color=0xC0C0C0)
 idle_alarm_label = label.Label(main_font, text="ALARM --:--", color=0xFFD27F)
-idle_weather_line1 = label.Label(weather_font, text="Hi: --\u00b0c Lo: --\u00b0c", color=0xBFE8FF)
+idle_weather_line1 = label.Label(weather_font, text="Hi: --(--) Lo: --(--)", color=0xBFE8FF)
 idle_weather_line2 = label.Label(weather_font, text="Weather", color=0xBFE8FF)
 idle_weather_line3 = label.Label(weather_font, text="Sun: --:-- - --:--", color=0xBFE8FF)
 idle_weather_line4 = label.Label(weather_font, text="", color=0xBFE8FF)
@@ -942,6 +1159,7 @@ events_group.append(events_alarm_label)
 PAPPA_BUTTON_W = 148
 PAPPA_BUTTON_H = 75
 PAPPA_BUTTON_MARGIN = 10
+PAPPA_BUTTON_Y_OFFSET = 6
 pappa_button_bitmap = displayio.Bitmap(PAPPA_BUTTON_W, PAPPA_BUTTON_H, 2)
 pappa_button_palette = displayio.Palette(2)
 pappa_button_palette[0] = 0x000000
@@ -963,7 +1181,7 @@ pappa_button_bg = displayio.TileGrid(
     pappa_button_bitmap,
     pixel_shader=pappa_button_palette,
     x=board.DISPLAY.width - PAPPA_BUTTON_W - PAPPA_BUTTON_MARGIN,
-    y=board.DISPLAY.height - PAPPA_BUTTON_H - PAPPA_BUTTON_MARGIN,
+    y=board.DISPLAY.height - PAPPA_BUTTON_H - PAPPA_BUTTON_MARGIN + PAPPA_BUTTON_Y_OFFSET,
 )
 pappa_button_label_top = label.Label(idle_font, text="PAPPA", color=0x000000)
 pappa_button_label_bottom = label.Label(idle_font, text="VECKA", color=0x000000)
@@ -986,6 +1204,11 @@ events_group.append(pappa_button_label_top)
 events_group.append(pappa_button_label_bottom)
 
 board.DISPLAY.root_group = idle_group
+try:
+    # Start dim immediately at boot so the panel does not flash full brightness.
+    board.DISPLAY.brightness = 0.18
+except Exception:
+    pass
 
 IDLE_MIN_X = 10
 IDLE_MIN_Y = 20
@@ -997,10 +1220,11 @@ pappavecka_active = False
 pappavecka_date = None
 mammavecka_active = False
 mammavecka_date = None
-weather_line1 = "Hi: --\u00b0c Lo: --\u00b0c"
+weather_line1 = "Hi: --(--) Lo: --(--)"
 weather_line2 = "Weather"
 weather_line3 = "Sun: --:-- - --:--"
 weather_line4 = ""
+weather_current = "--(--)"
 
 
 def right_align(lbl, margin=6):
@@ -1010,7 +1234,7 @@ def right_align(lbl, margin=6):
 def update_idle_labels(hour, minute, day, month_short):
     global x, y, max_x, max_y
     idle_time_label.text = "%02d:%02d" % (hour, minute)
-    idle_date_label.text = "%02d %s" % (day, month_short)
+    idle_date_label.text = "%02d %s %s" % (day, month_short, weather_current)
     idle_alarm_label.text = alarm_text if alarm_text else ""
     idle_weather_line1.text = weather_line1
     idle_weather_line2.text = weather_line2
@@ -1104,6 +1328,7 @@ def bounce_idle_labels():
 
 
 def update_events_panel(events, hour, minute, day, month_short):
+    events_header.text = "Events"
     events_time_label.text = "%02d:%02d" % (hour, minute)
     events_date_label.text = "%02d %s" % (day, month_short)
     events_alarm_label.text = alarm_text if alarm_text else ""
@@ -1145,6 +1370,51 @@ def update_events_panel(events, hour, minute, day, month_short):
             event_title_labels[i].text = ""
 
 
+def update_tasks_panel(task_rows, hour, minute, day, month_short):
+    events_header.text = "Tasks"
+    events_time_label.text = "%02d:%02d" % (hour, minute)
+    events_date_label.text = "%02d %s" % (day, month_short)
+    events_alarm_label.text = alarm_text if alarm_text else ""
+    left_margin = 6
+    bottom_margin = 8
+    row_gap = 6
+
+    time_h = events_time_label.bounding_box[3] * events_time_label.scale
+    date_h = events_date_label.bounding_box[3] * events_date_label.scale
+    reserved_h = date_h if alarm_text else 0
+
+    block_top = board.DISPLAY.height - (time_h + row_gap + date_h + row_gap + reserved_h) - bottom_margin
+    events_time_label.x = left_margin
+    events_time_label.y = int(block_top + 7)
+    events_date_label.x = left_margin
+    events_date_label.y = int(block_top + time_h + row_gap + 1)
+    if alarm_text:
+        events_alarm_label.x = left_margin
+        events_alarm_label.y = int(events_date_label.y + date_h + row_gap)
+
+    pappa_button_bg.hidden = not pappavecka_active
+    pappa_button_label_top.hidden = not pappavecka_active
+    pappa_button_label_bottom.hidden = not pappavecka_active
+
+    visible_rows = task_rows
+    if not visible_rows:
+        visible_rows = [("", "No tasks this week", 0x909090)]
+
+    for i in range(EVENT_ROWS):
+        if i < len(visible_rows):
+            row_date, row_title, row_color = visible_rows[i]
+            event_time_labels[i].text = row_date
+            time_w = event_time_labels[i].bounding_box[2] * event_time_labels[i].scale
+            event_time_labels[i].x = EVENT_TIME_RIGHT_X - time_w
+            event_title_labels[i].text = row_title
+            event_time_labels[i].color = row_color
+            event_title_labels[i].color = row_color
+        else:
+            event_time_labels[i].text = ""
+            event_time_labels[i].x = EVENT_TIME_RIGHT_X
+            event_title_labels[i].text = ""
+
+
 def play_wav(filename):
     try:
         with open(filename, "rb") as f:
@@ -1171,11 +1441,19 @@ def say_time(hour, minute):
 # --- Startup calendar fetch ---
 events = fetch_next_events()
 log_main_screen_events(events)
-weather_line1, weather_line2, weather_line3, weather_line4 = fetch_malmo_weather_lines()
+weather_line1, weather_line2, weather_line3, weather_line4, weather_current = fetch_malmo_weather_lines()
 
 current_utc_offset_seconds = _parse_utc_offset_seconds("+00:00")
 alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
     events, current_utc_offset_seconds
+)
+log_alarm_choice(
+    alarm_utc_epoch,
+    alarm_event_utc_epoch,
+    alarm_text,
+    alarm_event_key,
+    current_utc_offset_seconds,
+    None,
 )
 alarm_fired_for_key = None
 
@@ -1186,8 +1464,74 @@ def prime_events_view(hour, minute, day, month_short):
 
 def sync_time_and_forecast():
     local_epoch, offset_seconds = sync_stockholm_epoch()
-    line1, line2, line3, line4 = fetch_malmo_weather_lines()
-    return local_epoch, offset_seconds, line1, line2, line3, line4
+    line1, line2, line3, line4, current_compact = fetch_malmo_weather_lines()
+    return local_epoch, offset_seconds, line1, line2, line3, line4, current_compact
+
+
+IDLE_BRIGHTNESS_MAX = 1.00
+IDLE_BRIGHTNESS_SENSOR_FALLBACK = 0.18
+ACTIVE_BRIGHTNESS = 1.00
+AMBIENT_DARK_RAW = 2300
+AMBIENT_BRIGHT_RAW = 5000
+AMBIENT_IDLE_MIN_BRIGHTNESS = 0.03
+AMBIENT_LOG_INTERVAL_SECONDS = 1.0
+AMBIENT_LOG_RAW_DELTA = 1500
+current_brightness = None
+last_ambient_log_time = None
+last_ambient_log_raw = None
+
+
+def set_display_brightness(level):
+    global current_brightness
+    if current_brightness is not None and abs(current_brightness - level) < 0.001:
+        return
+    try:
+        board.DISPLAY.brightness = level
+        current_brightness = level
+    except Exception:
+        pass
+
+
+def read_ambient_light_scale():
+    global last_ambient_log_time, last_ambient_log_raw
+    if light_sensor is None:
+        return None
+    try:
+        raw = light_sensor.value
+    except Exception:
+        return None
+
+    if raw <= AMBIENT_DARK_RAW:
+        target_scale = 0.0
+    elif raw >= AMBIENT_BRIGHT_RAW:
+        target_scale = 1.0
+    else:
+        target_scale = (raw - AMBIENT_DARK_RAW) / float(AMBIENT_BRIGHT_RAW - AMBIENT_DARK_RAW)
+
+    now = time.monotonic()
+    should_log = last_ambient_log_time is None or (now - last_ambient_log_time) >= AMBIENT_LOG_INTERVAL_SECONDS
+    if (last_ambient_log_raw is not None) and (abs(raw - last_ambient_log_raw) >= AMBIENT_LOG_RAW_DELTA):
+        should_log = True
+    if should_log:
+        print("LIGHT raw=%d scale=%.3f" % (raw, target_scale))
+        last_ambient_log_time = now
+        last_ambient_log_raw = raw
+
+    return target_scale
+
+
+def adaptive_idle_brightness(hour):
+    _ = hour
+    base_level = IDLE_BRIGHTNESS_MAX
+    ambient_scale_now = read_ambient_light_scale()
+    if ambient_scale_now is None:
+        return IDLE_BRIGHTNESS_SENSOR_FALLBACK
+    scaled_level = base_level * ambient_scale_now
+    if scaled_level < AMBIENT_IDLE_MIN_BRIGHTNESS:
+        return AMBIENT_IDLE_MIN_BRIGHTNESS
+    if scaled_level > base_level:
+        return base_level
+    return scaled_level
 
 
 # --- Main loop ---
@@ -1215,6 +1559,7 @@ while True:
                 weather_line2,
                 weather_line3,
                 weather_line4,
+                weather_current,
             ) = sync_time_and_forecast()
             events = fetch_next_events()
             log_main_screen_events(events)
@@ -1229,6 +1574,14 @@ while True:
             )
             if alarm_event_key != prev_key:
                 alarm_fired_for_key = None
+                log_alarm_choice(
+                    alarm_utc_epoch,
+                    alarm_event_utc_epoch,
+                    alarm_text,
+                    alarm_event_key,
+                    current_utc_offset_seconds,
+                    sync_utc_epoch,
+                )
         except Exception:
             pass
 
@@ -1252,6 +1605,7 @@ while True:
             and alarm_event_key is not None
             and alarm_fired_for_key != alarm_event_key
         ):
+            set_display_brightness(ACTIVE_BRIGHTNESS)
             board.DISPLAY.root_group = events_group
             update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
             run_alarm_until_touch()
@@ -1288,6 +1642,14 @@ while True:
                 alarm_event_key = None
             if alarm_event_key != prev_key:
                 alarm_fired_for_key = None
+                log_alarm_choice(
+                    alarm_utc_epoch,
+                    alarm_event_utc_epoch,
+                    alarm_text,
+                    alarm_event_key,
+                    current_utc_offset_seconds,
+                    current_utc_epoch,
+                )
 
     # One-time warmup of events panel once we have valid time/date.
     if current_hour is not None and events_mode_until == 0:
@@ -1299,6 +1661,7 @@ while True:
 
     p = ts.touch_point
     if p and current_hour is not None:
+        set_display_brightness(ACTIVE_BRIGHTNESS)
         update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
         board.DISPLAY.root_group = events_group
         say_time(current_hour, current_minute)
@@ -1306,8 +1669,12 @@ while True:
         time.sleep(1)
 
     if now < events_mode_until:
+        set_display_brightness(ACTIVE_BRIGHTNESS)
         board.DISPLAY.root_group = events_group
+        if current_hour is not None:
+            update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
     else:
+        set_display_brightness(adaptive_idle_brightness(current_hour))
         board.DISPLAY.root_group = idle_group
         if current_hour is None:
             set_idle_position(x, y)

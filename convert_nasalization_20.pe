@@ -1,0 +1,7 @@
+#!fontforge -script
+Open("/Users/axelmansson/Library/Fonts/nasalization_rg.ttf")
+Reencode("unicode")
+SetFontNames("Nasalization-Regular-20", "Nasalization-Regular-20", "Nasalization-Regular-20")
+BitmapsAvail([20])
+Generate("/Users/axelmansson/Documents/GitHub/CPY talking clock/fonts/Nasalization-Regular-20.bdf")
+Quit(0)
