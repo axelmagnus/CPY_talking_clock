@@ -298,6 +298,7 @@ DIAG_SAMPLE_INTERVAL_SECONDS = 20.0
 DIAG_LOG_PATH = "/diag_runtime.log"
 PERF_LOG_ENABLED = True
 PERF_LOG_INTERVAL_SECONDS = 30.0
+PERF_SYNC_LOG_ENABLED = True
 
 
 def append_diag_line(line):
@@ -1624,12 +1625,14 @@ events_mode_until = 0
 sync_reposition_pending = False
 last_idle_update_key = None
 last_events_update_second = None
+last_events_update_minute = None
 force_events_panel_refresh = True
 active_root_group = idle_group
 last_perf_log = 0.0
 last_loop_now = None
 loop_count_since_log = 0
 loop_dt_max_ms = 0
+last_gc_collect = 0.0
 
 
 def set_root_group(target_group):
@@ -1642,6 +1645,11 @@ def set_root_group(target_group):
 while True:
     now = time.monotonic()
 
+    # Periodic GC helps reclaim short-lived network/UI allocations on constrained heaps.
+    if (now - last_gc_collect) >= 20.0:
+        gc.collect()
+        last_gc_collect = now
+
     if PERF_LOG_ENABLED:
         if last_loop_now is not None:
             dt_ms = int((now - last_loop_now) * 1000)
@@ -1652,7 +1660,14 @@ while True:
 
     if (clock_base_local_epoch is None) or (now - last_time_sync > TIME_SYNC_INTERVAL):
         try:
-            # Keep weather refresh coupled to each successful time sync.
+            sync_t0 = time.monotonic()
+            mem_before_sync = gc.mem_free()
+            # Split SYNC timing for perf analysis
+            t_time0 = time.monotonic()
+            local_epoch, offset_seconds = sync_stockholm_epoch()
+            t_time1 = time.monotonic()
+            line1, line2, line3, line4, current_compact = fetch_malmo_weather_lines()
+            t_weather1 = time.monotonic()
             (
                 clock_base_local_epoch,
                 current_utc_offset_seconds,
@@ -1661,8 +1676,17 @@ while True:
                 weather_line3,
                 weather_line4,
                 weather_current,
-            ) = sync_time_and_forecast()
+            ) = (
+                local_epoch,
+                offset_seconds,
+                line1,
+                line2,
+                line3,
+                line4,
+                current_compact,
+            )
             refreshed_events = fetch_next_events()
+            t_cal1 = time.monotonic()
             if refreshed_events or not events:
                 events = refreshed_events
                 if events:
@@ -1675,6 +1699,23 @@ while True:
             last_time_sync = now
             sync_reposition_pending = True
             force_events_panel_refresh = True
+            if PERF_SYNC_LOG_ENABLED:
+                sync_ms = int((t_cal1 - sync_t0) * 1000)
+                t_time_ms = int((t_time1 - t_time0) * 1000)
+                t_weather_ms = int((t_weather1 - t_time1) * 1000)
+                t_cal_ms = int((t_cal1 - t_weather1) * 1000)
+                print(
+                    "SYNC ms=%d (time=%d weather=%d cal=%d) free_before=%d free_after=%d ev=%d"
+                    % (
+                        sync_ms,
+                        t_time_ms,
+                        t_weather_ms,
+                        t_cal_ms,
+                        mem_before_sync,
+                        gc.mem_free(),
+                        len(events) if events else 0,
+                    )
+                )
             # Refresh alarm display/time against latest offset.
             sync_utc_epoch = clock_base_local_epoch - current_utc_offset_seconds
             prev_key = alarm_event_key
@@ -1719,6 +1760,7 @@ while True:
             set_root_group(events_group)
             update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
             last_events_update_second = current_second
+            last_events_update_minute = current_minute
             force_events_panel_refresh = False
             run_alarm_until_touch()
             alarm_fired_for_key = alarm_event_key
@@ -1790,6 +1832,7 @@ while True:
         set_display_brightness(ACTIVE_BRIGHTNESS)
         update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
         last_events_update_second = current_second
+        last_events_update_minute = current_minute
         force_events_panel_refresh = False
         set_root_group(events_group)
         say_time(current_hour, current_minute)
@@ -1800,15 +1843,17 @@ while True:
         set_display_brightness(ACTIVE_BRIGHTNESS)
         set_root_group(events_group)
         if current_hour is not None and (
-            force_events_panel_refresh or (current_second != last_events_update_second)
+            force_events_panel_refresh or (current_minute != last_events_update_minute)
         ):
             update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
             last_events_update_second = current_second
+            last_events_update_minute = current_minute
             force_events_panel_refresh = False
     else:
         set_display_brightness(adaptive_idle_brightness(current_hour))
         set_root_group(idle_group)
         last_events_update_second = None
+        last_events_update_minute = None
         force_events_panel_refresh = True
         if current_hour is None:
             set_idle_position(x, y)
