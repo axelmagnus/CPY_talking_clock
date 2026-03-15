@@ -5,6 +5,8 @@
 import time
 import os
 import random
+import math
+import array
 import board
 import busio
 import digitalio
@@ -879,29 +881,79 @@ def run_alarm_until_touch(max_duration_seconds=30):
             sustain_level=0.65,
             release_time=0.16,
         )
-        synth = synthio.Synthesizer(sample_rate=22050, envelope=env)
+        # Richer but still soft timbre: fundamental + 2nd/3rd harmonics.
+        warm_wave = array.array("h", [0] * 256)
+        for i in range(256):
+            phase = (2.0 * math.pi * i) / 256.0
+            sample = (
+                math.sin(phase)
+                + 0.33 * math.sin(2.0 * phase)
+                + 0.16 * math.sin(3.0 * phase)
+            )
+            warm_wave[i] = int(sample * 21000)
+
+        synth = synthio.Synthesizer(sample_rate=22050, envelope=env, waveform=warm_wave)
         audio.play(synth)
 
-        # Simplified melody from BWV 1068 "Air" (gentle 16-note loop).
-        beat_seconds = 0.46
+        # Air timing tuned from the test script; opening note intentionally shortened.
+        beat_seconds = 60.0 / 72.0
+        vibrato_rate_hz = 5.2
+        vibrato_depth_cents = 10.0
         phrase = (
-            (78, 1.0, 0.13),
-            (83, 1.5, 0.12),
-            (79, 1.0, 0.12),
-            (78, 1.0, 0.12),
-            (76, 1.0, 0.12),
-            (74, 1.0, 0.11),
-            (73, 1.0, 0.11),
-            (74, 1.5, 0.11),
-            (73, 1.0, 0.11),
-            (71, 1.0, 0.11),
-            (69, 1.5, 0.11),
-            (81, 1.0, 0.12),
-            (78, 1.0, 0.12),
-            (72, 1.0, 0.11),
-            (71, 1.0, 0.11),
-            (76, 2.0, 0.11),
+            (78, 3.0, 0.14),
+            (78, 0.75, 0.13),
+            (83, 0.25, 0.12),
+            (79, 0.25, 0.12),
+            (76, 0.25, 0.12),
+            (74, 0.25, 0.12),
+            (73, 0.25, 0.12),
+            (74, 0.25, 0.12),
+            (73, 1.0, 0.12),
+            (69, 1.0, 0.11),
+            (81, 2.0, 0.13),
+            (81, 0.25, 0.12),
+            (78, 0.25, 0.12),
+            (72, 0.25, 0.11),
+            (71, 0.25, 0.11),
+            (76, 0.25, 0.12),
+            (75, 0.25, 0.11),
+            (81, 0.25, 0.12),
+            (79, 0.25, 0.12),
+            (79, 2.0, 0.12),
+            (78, 1.5, 0.12),
+            (79, 0.25, 0.11),
+            (81, 0.25, 0.11),
+            (74, 0.5, 0.10),
+            (74, 0.125, 0.10),
+            (76, 0.125, 0.10),
+            (78, 0.25, 0.11),
+            (76, 0.25, 0.11),
+            (76, 0.25, 0.11),
+            (74, 0.25, 0.11),
+            (73, 0.25, 0.11),
+            (71, 0.25, 0.11),
+            (69, 0.25, 0.11),
+            (81, 0.375, 0.12),
+            (78, 0.125, 0.11),
+            (72, 0.125, 0.10),
+            (71, 0.125, 0.10),
+            (76, 0.125, 0.11),
+            (75, 0.125, 0.10),
+            (81, 0.125, 0.11),
+            (79, 0.125, 0.11),
+            (79, 2.0, 0.12),
+            (73, 0.25, 0.11),
+            (71, 0.25, 0.11),
+            (71, 0.125, 0.11),
+            (73, 0.125, 0.11),
+            (74, 0.25, 0.11),
+            (73, 0.5, 0.11),
+            (71, 0.25, 0.11),
+            (69, 2.0, 0.11),
         )
+
+        note_poll_sleep = 0.01
+        inter_note_gap = 0.006
 
         start_t = time.monotonic()
         while True:
@@ -916,27 +968,32 @@ def run_alarm_until_touch(max_duration_seconds=30):
                 if (time.monotonic() - start_t) >= max_duration_seconds:
                     break
 
-                note = synthio.Note(frequency=synthio.midi_to_hz(midi_note), amplitude=amp)
+                note = synthio.Note(frequency=synthio.midi_to_hz(midi_note), amplitude=1.0)
                 current_note = (note,)
                 synth.press(current_note)
 
                 note_end = time.monotonic() + (beat_seconds * beats)
+                note_start = time.monotonic()
+                base_freq = synthio.midi_to_hz(midi_note)
                 while time.monotonic() < note_end:
                     if ts.touch_point:
                         break
                     if (time.monotonic() - start_t) >= max_duration_seconds:
                         break
-                    time.sleep(0.02)
+                    lfo_t = time.monotonic() - note_start
+                    cents = math.sin(2.0 * math.pi * vibrato_rate_hz * lfo_t) * vibrato_depth_cents
+                    note.frequency = base_freq * (2.0 ** (cents / 1200.0))
+                    time.sleep(note_poll_sleep)
 
                 synth.release(current_note)
 
-                pause_end = time.monotonic() + 0.025
+                pause_end = time.monotonic() + inter_note_gap
                 while time.monotonic() < pause_end:
                     if ts.touch_point:
                         break
                     if (time.monotonic() - start_t) >= max_duration_seconds:
                         break
-                    time.sleep(0.01)
+                    time.sleep(note_poll_sleep)
 
                 if ts.touch_point:
                     break
