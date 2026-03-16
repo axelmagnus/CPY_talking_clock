@@ -1,3 +1,26 @@
+# --- Crash protection: log and auto-restart on main loop exception ---
+import microcontroller
+
+# ...existing code...
+
+def log_crash(e):
+    try:
+        with open("/error.txt", "a") as f:
+            import traceback
+            f.write("\n--- Crash ---\n")
+            f.write(repr(e) + "\n")
+            f.write(traceback.format_exc())
+    except Exception:
+        pass
+
+# --- Main loop with crash protection ---
+while True:
+    try:
+        # ...existing main loop code...
+        break  # Remove or replace with your actual main loop logic
+    except Exception as e:
+        log_crash(e)
+        microcontroller.reset()
 # CircuitPython Talking Clock for PyPortal
 # Shows bouncing clock, speaks time on touch, and fetches next Google Calendar events.
 
@@ -1108,7 +1131,7 @@ events_group.append(events_header)
 
 EVENT_TIME_X = 6
 EVENT_TITLE_X = 66
-EVENT_TIME_RIGHT_X = EVENT_TITLE_X - 6
+EVENT_TIME_RIGHT_X = EVENT_TITLE_X - 3
 EVENT_ROWS = 7
 EVENT_ROW_START_Y = 29
 EVENT_ROW_GAP = 20
@@ -1323,7 +1346,7 @@ def update_events_panel(events, hour, minute, day, month_short):
     reserved_h = date_h if alarm_text else 0
 
     block_top = board.DISPLAY.height - (time_h + row_gap + date_h + row_gap + reserved_h) - bottom_margin
-    events_time_label.x = left_margin
+    events_time_label.x = left_margin-2
     events_time_label.y = int(block_top + 7)
     events_date_label.x = left_margin
     events_date_label.y = int(block_top + time_h + row_gap + 1)
@@ -1502,276 +1525,291 @@ def set_root_group(target_group):
         return
     board.DISPLAY.root_group = target_group
     active_root_group = target_group
+import microcontroller
+
+def log_crash(e):
+    try:
+        with open("/error.txt", "a") as f:
+            import traceback
+            f.write("\n--- Crash ---\n")
+            f.write(repr(e) + "\n")
+            f.write(traceback.format_exc())
+    except Exception:
+        pass
 
 while True:
-    now = time.monotonic()
-
-    # Periodic GC helps reclaim short-lived network/UI allocations on constrained heaps.
-    if (now - last_gc_collect) >= 20.0:
-        gc_t0 = time.monotonic()
-        gc.collect()
-        last_gc_collect = now
-        if PERF_STALL_LOG_ENABLED:
-            gc_ms = int((time.monotonic() - gc_t0) * 1000)
-            if gc_ms >= PERF_GC_LOG_THRESHOLD_MS:
-                print("GC ms=%d free=%d" % (gc_ms, gc.mem_free()))
-
-    if PERF_LOG_ENABLED:
-        if last_loop_now is not None:
-            dt_ms = int((now - last_loop_now) * 1000)
-            if dt_ms > loop_dt_max_ms:
-                loop_dt_max_ms = dt_ms
-            if PERF_STALL_LOG_ENABLED and dt_ms >= PERF_STALL_THRESHOLD_MS:
-                print(
-                    "STALL dt_ms=%d mode=%s free=%d ev=%d"
-                    % (
-                        dt_ms,
-                        "E" if active_root_group is events_group else "I",
-                        gc.mem_free(),
-                        len(events) if events else 0,
-                    )
-                )
-        last_loop_now = now
-        loop_count_since_log += 1
-
-    if (clock_base_local_epoch is None) or (now - last_time_sync > TIME_SYNC_INTERVAL):
-        try:
-            sync_t0 = time.monotonic()
-            mem_before_sync = gc.mem_free()
-            # Split SYNC timing for perf analysis
-            t_time0 = time.monotonic()
-            local_epoch, offset_seconds = sync_stockholm_epoch()
-            t_time1 = time.monotonic()
-            line1, line2, line3, line4, current_compact = fetch_malmo_weather_lines()
-            t_weather1 = time.monotonic()
-            (
-                clock_base_local_epoch,
-                current_utc_offset_seconds,
-                weather_line1,
-                weather_line2,
-                weather_line3,
-                weather_line4,
-                weather_current,
-            ) = (
-                local_epoch,
-                offset_seconds,
-                line1,
-                line2,
-                line3,
-                line4,
-                current_compact,
-            )
-            refresh_calendar_now = (not events) or ((now - last_calendar_sync) > CALENDAR_SYNC_INTERVAL)
-            if refresh_calendar_now:
-                refreshed_events = fetch_next_events()
-                t_cal1 = time.monotonic()
-                if refreshed_events or not events:
-                    events = refreshed_events
-                    if events:
-                        last_good_events = events
-                elif last_good_events:
-                    # Keep most recent valid events if a transient refresh returns none.
-                    events = last_good_events
-                last_calendar_sync = now
-            else:
-                t_cal1 = time.monotonic()
-            gc.collect()
-            log_main_screen_events(events)
-            clock_base_monotonic = now
-            last_time_sync = now
-            sync_reposition_pending = True
-            force_events_panel_refresh = True
-            if PERF_SYNC_LOG_ENABLED:
-                sync_ms = int((t_cal1 - sync_t0) * 1000)
-                t_time_ms = int((t_time1 - t_time0) * 1000)
-                t_weather_ms = int((t_weather1 - t_time1) * 1000)
-                t_cal_ms = int((t_cal1 - t_weather1) * 1000)
-                print(
-                    "SYNC ms=%d (time=%d weather=%d cal=%d) free_before=%d free_after=%d ev=%d"
-                    % (
-                        sync_ms,
-                        t_time_ms,
-                        t_weather_ms,
-                        t_cal_ms,
-                        mem_before_sync,
-                        gc.mem_free(),
-                        len(events) if events else 0,
-                    )
-                )
-            # Refresh alarm display/time against latest offset.
-            sync_utc_epoch = clock_base_local_epoch - current_utc_offset_seconds
-            prev_key = alarm_event_key
-            alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
-                events, current_utc_offset_seconds, sync_utc_epoch
-            )
-            if alarm_event_key != prev_key:
-                alarm_fired_for_key = None
-                log_alarm_choice(
-                    alarm_utc_epoch,
-                    alarm_event_utc_epoch,
-                    alarm_text,
-                    alarm_event_key,
-                    current_utc_offset_seconds,
-                    sync_utc_epoch,
-                )
-        except Exception as e:
-            log_exception("sync_and_refresh", e)
-
-    if (clock_base_local_epoch is not None) and (clock_base_monotonic is not None):
-        elapsed = int(now - clock_base_monotonic)
-        current_local_epoch = clock_base_local_epoch + elapsed
-        current_utc_epoch = current_local_epoch - current_utc_offset_seconds
-        current_hour, current_minute, current_day, current_month_short = stockholm_components_from_epoch(current_local_epoch)
-        current_second = current_local_epoch % 60
-
-        if sync_reposition_pending:
-            x = random.randint(IDLE_MIN_X, max_x) if max_x > IDLE_MIN_X else IDLE_MIN_X
-            y = random.randint(IDLE_MIN_Y, max_y) if max_y > IDLE_MIN_Y else IDLE_MIN_Y
-            sync_reposition_pending = False
-
-        # Trigger alarm once when entering alarm window for first event.
-        if (
-            alarm_utc_epoch is not None
-            and alarm_event_utc_epoch is not None
-            and current_utc_epoch >= alarm_utc_epoch
-            and current_utc_epoch < alarm_event_utc_epoch
-            and alarm_event_key is not None
-            and alarm_fired_for_key != alarm_event_key
-        ):
-            set_display_brightness(ACTIVE_BRIGHTNESS)
-            set_root_group(events_group)
-            update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
-            last_events_update_second = current_second
-            last_events_update_minute = current_minute
-            force_events_panel_refresh = False
-            run_alarm_until_touch()
-            alarm_fired_for_key = alarm_event_key
-
-        # Keep schedule state fresh between syncs so expired alarms disappear immediately.
-        events_pruned = False
-        while events:
-            first_start_dt = events[0].get("start", {}).get("dateTime", "")
-            if not first_start_dt:
-                break
-            try:
-                first_event_utc_epoch = rfc3339_to_epoch(first_start_dt)
-            except Exception:
-                break
-            if first_event_utc_epoch <= current_utc_epoch:
-                events = events[1:]
-                events_pruned = True
-            else:
-                break
-
-        alarm_window_expired = (
-            alarm_event_utc_epoch is not None and current_utc_epoch >= alarm_event_utc_epoch
-        )
-        if events_pruned or alarm_window_expired:
-            prev_key = alarm_event_key
-            alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
-                events, current_utc_offset_seconds, current_utc_epoch
-            )
-            if alarm_event_utc_epoch is not None and current_utc_epoch >= alarm_event_utc_epoch:
-                alarm_utc_epoch = None
-                alarm_event_utc_epoch = None
-                alarm_text = ""
-                alarm_event_key = None
-            if alarm_event_key != prev_key:
-                alarm_fired_for_key = None
-                log_alarm_choice(
-                    alarm_utc_epoch,
-                    alarm_event_utc_epoch,
-                    alarm_text,
-                    alarm_event_key,
-                    current_utc_offset_seconds,
-                    current_utc_epoch,
-                )
-
-    ui_stage = 0
     try:
-        # One-time warmup of events panel once we have valid time/date.
-        ui_stage = 10
-        if current_hour is not None and events_mode_until == 0:
-            prime_events_view(current_hour, current_minute, current_day, current_month_short)
-            events_mode_until = -1
+        now = time.monotonic()
 
-        ui_stage = 20
-        if current_hour is not None:
-            idle_changed = (
-                (current_hour != last_idle_hour)
-                or (current_minute != last_idle_minute)
-                or (current_day != last_idle_day)
-                or (current_month_short != last_idle_month_short)
-                or (weather_current != last_idle_weather_current)
-                or (weather_line1 != last_idle_weather_line1)
-                or (weather_line2 != last_idle_weather_line2)
-                or (weather_line3 != last_idle_weather_line3)
-                or (weather_line4 != last_idle_weather_line4)
-                or (alarm_text != last_idle_alarm_text)
-            )
-            if idle_changed:
-                update_idle_labels(current_hour, current_minute, current_day, current_month_short)
-                last_idle_hour = current_hour
-                last_idle_minute = current_minute
-                last_idle_day = current_day
-                last_idle_month_short = current_month_short
-                last_idle_weather_current = weather_current
-                last_idle_weather_line1 = weather_line1
-                last_idle_weather_line2 = weather_line2
-                last_idle_weather_line3 = weather_line3
-                last_idle_weather_line4 = weather_line4
-                last_idle_alarm_text = alarm_text
+        # Periodic GC helps reclaim short-lived network/UI allocations on constrained heaps.
+        if (now - last_gc_collect) >= 20.0:
+            gc_t0 = time.monotonic()
+            gc.collect()
+            last_gc_collect = now
+            if PERF_STALL_LOG_ENABLED:
+                gc_ms = int((time.monotonic() - gc_t0) * 1000)
+                if gc_ms >= PERF_GC_LOG_THRESHOLD_MS:
+                    print("GC ms=%d free=%d" % (gc_ms, gc.mem_free()))
 
-        ui_stage = 30
-        p = ts.touch_point if ENABLE_MAIN_LOOP_TOUCH else None
-        if p and current_hour is not None:
-            set_display_brightness(ACTIVE_BRIGHTNESS)
-            # Update the main screen clock label before showing events screen
-            update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
-            set_root_group(events_group)
-            # Switch immediately on touch; defer heavy text relayout to the events-view refresh path.
-            force_events_panel_refresh = True
-            last_events_update_second = current_second
-            last_events_update_minute = None
-            # Update the main screen clock before speech
-            update_idle_labels(current_hour, current_minute, current_day, current_month_short)
-            if (now - last_touch_speak_at) >= TOUCH_SPEAK_COOLDOWN_SECONDS:
-                say_time(current_hour, current_minute)
-                last_touch_speak_at = now
-            events_mode_until = now + 12
+        if PERF_LOG_ENABLED:
+            if last_loop_now is not None:
+                dt_ms = int((now - last_loop_now) * 1000)
+                if dt_ms > loop_dt_max_ms:
+                    loop_dt_max_ms = dt_ms
+                if PERF_STALL_LOG_ENABLED and dt_ms >= PERF_STALL_THRESHOLD_MS:
+                    print(
+                        "STALL dt_ms=%d mode=%s free=%d ev=%d"
+                        % (
+                            dt_ms,
+                            "E" if active_root_group is events_group else "I",
+                            gc.mem_free(),
+                            len(events) if events else 0,
+                        )
+                    )
+            last_loop_now = now
+            loop_count_since_log += 1
 
-        ui_stage = 40
-        if now < events_mode_until:
-            set_display_brightness(ACTIVE_BRIGHTNESS)
-            set_root_group(events_group)
-            if current_hour is not None and (
-                force_events_panel_refresh or (current_minute != last_events_update_minute)
+        if (clock_base_local_epoch is None) or (now - last_time_sync > TIME_SYNC_INTERVAL):
+            try:
+                sync_t0 = time.monotonic()
+                mem_before_sync = gc.mem_free()
+                # Split SYNC timing for perf analysis
+                t_time0 = time.monotonic()
+                local_epoch, offset_seconds = sync_stockholm_epoch()
+                t_time1 = time.monotonic()
+                line1, line2, line3, line4, current_compact = fetch_malmo_weather_lines()
+                t_weather1 = time.monotonic()
+                (
+                    clock_base_local_epoch,
+                    current_utc_offset_seconds,
+                    weather_line1,
+                    weather_line2,
+                    weather_line3,
+                    weather_line4,
+                    weather_current,
+                ) = (
+                    local_epoch,
+                    offset_seconds,
+                    line1,
+                    line2,
+                    line3,
+                    line4,
+                    current_compact,
+                )
+                refresh_calendar_now = (not events) or ((now - last_calendar_sync) > CALENDAR_SYNC_INTERVAL)
+                if refresh_calendar_now:
+                    refreshed_events = fetch_next_events()
+                    t_cal1 = time.monotonic()
+                    if refreshed_events or not events:
+                        events = refreshed_events
+                        if events:
+                            last_good_events = events
+                    elif last_good_events:
+                        # Keep most recent valid events if a transient refresh returns none.
+                        events = last_good_events
+                    last_calendar_sync = now
+                else:
+                    t_cal1 = time.monotonic()
+                gc.collect()
+                log_main_screen_events(events)
+                clock_base_monotonic = now
+                last_time_sync = now
+                sync_reposition_pending = True
+                force_events_panel_refresh = True
+                if PERF_SYNC_LOG_ENABLED:
+                    sync_ms = int((t_cal1 - sync_t0) * 1000)
+                    t_time_ms = int((t_time1 - t_time0) * 1000)
+                    t_weather_ms = int((t_weather1 - t_time1) * 1000)
+                    t_cal_ms = int((t_cal1 - t_weather1) * 1000)
+                    print(
+                        "SYNC ms=%d (time=%d weather=%d cal=%d) free_before=%d free_after=%d ev=%d"
+                        % (
+                            sync_ms,
+                            t_time_ms,
+                            t_weather_ms,
+                            t_cal_ms,
+                            mem_before_sync,
+                            gc.mem_free(),
+                            len(events) if events else 0,
+                        )
+                    )
+                # Refresh alarm display/time against latest offset.
+                sync_utc_epoch = clock_base_local_epoch - current_utc_offset_seconds
+                prev_key = alarm_event_key
+                alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
+                    events, current_utc_offset_seconds, sync_utc_epoch
+                )
+                if alarm_event_key != prev_key:
+                    alarm_fired_for_key = None
+                    log_alarm_choice(
+                        alarm_utc_epoch,
+                        alarm_event_utc_epoch,
+                        alarm_text,
+                        alarm_event_key,
+                        current_utc_offset_seconds,
+                        sync_utc_epoch,
+                    )
+            except Exception as e:
+                log_exception("sync_and_refresh", e)
+
+        if (clock_base_local_epoch is not None) and (clock_base_monotonic is not None):
+            elapsed = int(now - clock_base_monotonic)
+            current_local_epoch = clock_base_local_epoch + elapsed
+            current_utc_epoch = current_local_epoch - current_utc_offset_seconds
+            current_hour, current_minute, current_day, current_month_short = stockholm_components_from_epoch(current_local_epoch)
+            current_second = current_local_epoch % 60
+
+            if sync_reposition_pending:
+                x = random.randint(IDLE_MIN_X, max_x) if max_x > IDLE_MIN_X else IDLE_MIN_X
+                y = random.randint(IDLE_MIN_Y, max_y) if max_y > IDLE_MIN_Y else IDLE_MIN_Y
+                sync_reposition_pending = False
+
+            # Trigger alarm once when entering alarm window for first event.
+            if (
+                alarm_utc_epoch is not None
+                and alarm_event_utc_epoch is not None
+                and current_utc_epoch >= alarm_utc_epoch
+                and current_utc_epoch < alarm_event_utc_epoch
+                and alarm_event_key is not None
+                and alarm_fired_for_key != alarm_event_key
             ):
+                set_display_brightness(ACTIVE_BRIGHTNESS)
+                set_root_group(events_group)
                 update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
                 last_events_update_second = current_second
                 last_events_update_minute = current_minute
                 force_events_panel_refresh = False
-        else:
-            if (now - last_idle_brightness_update) >= 0.5:
-                cached_idle_brightness = adaptive_idle_brightness(current_hour)
-                last_idle_brightness_update = now
-            set_display_brightness(cached_idle_brightness)
-            set_root_group(idle_group)
-            last_events_update_second = None
-            last_events_update_minute = None
-            force_events_panel_refresh = True
-            if current_hour is None:
-                set_idle_position(x, y)
-            else:
-                if (now - last_idle_bounce_update) >= 0.10:
-                    bounce_idle_labels()
-                    last_idle_bounce_update = now
-    except MemoryError:
-        print("MEMERR ui_stage=%d free=%d alloc=%d" % (ui_stage, gc.mem_free(), gc.mem_alloc()))
-        gc.collect()
-        time.sleep(0.2)
-        continue
+                run_alarm_until_touch()
+                alarm_fired_for_key = alarm_event_key
 
+            # Keep schedule state fresh between syncs so expired alarms disappear immediately.
+            events_pruned = False
+            while events:
+                first_start_dt = events[0].get("start", {}).get("dateTime", "")
+                if not first_start_dt:
+                    break
+                try:
+                    first_event_utc_epoch = rfc3339_to_epoch(first_start_dt)
+                except Exception:
+                    break
+                if first_event_utc_epoch <= current_utc_epoch:
+                    events = events[1:]
+                    events_pruned = True
+                else:
+                    break
+
+            alarm_window_expired = (
+                alarm_event_utc_epoch is not None and current_utc_epoch >= alarm_event_utc_epoch
+            )
+            if events_pruned or alarm_window_expired:
+                prev_key = alarm_event_key
+                alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
+                    events, current_utc_offset_seconds, current_utc_epoch
+                )
+                if alarm_event_utc_epoch is not None and current_utc_epoch >= alarm_event_utc_epoch:
+                    alarm_utc_epoch = None
+                    alarm_event_utc_epoch = None
+                    alarm_text = ""
+                    alarm_event_key = None
+                if alarm_event_key != prev_key:
+                    alarm_fired_for_key = None
+                    log_alarm_choice(
+                        alarm_utc_epoch,
+                        alarm_event_utc_epoch,
+                        alarm_text,
+                        alarm_event_key,
+                        current_utc_offset_seconds,
+                        current_utc_epoch,
+                    )
+
+        ui_stage = 0
+        try:
+            # One-time warmup of events panel once we have valid time/date.
+            ui_stage = 10
+            if current_hour is not None and events_mode_until == 0:
+                prime_events_view(current_hour, current_minute, current_day, current_month_short)
+                events_mode_until = -1
+
+            ui_stage = 20
+            if current_hour is not None:
+                idle_changed = (
+                    (current_hour != last_idle_hour)
+                    or (current_minute != last_idle_minute)
+                    or (current_day != last_idle_day)
+                    or (current_month_short != last_idle_month_short)
+                    or (weather_current != last_idle_weather_current)
+                    or (weather_line1 != last_idle_weather_line1)
+                    or (weather_line2 != last_idle_weather_line2)
+                    or (weather_line3 != last_idle_weather_line3)
+                    or (weather_line4 != last_idle_weather_line4)
+                    or (alarm_text != last_idle_alarm_text)
+                )
+                if idle_changed:
+                    update_idle_labels(current_hour, current_minute, current_day, current_month_short)
+                    last_idle_hour = current_hour
+                    last_idle_minute = current_minute
+                    last_idle_day = current_day
+                    last_idle_month_short = current_month_short
+                    last_idle_weather_current = weather_current
+                    last_idle_weather_line1 = weather_line1
+                    last_idle_weather_line2 = weather_line2
+                    last_idle_weather_line3 = weather_line3
+                    last_idle_weather_line4 = weather_line4
+                    last_idle_alarm_text = alarm_text
+
+            ui_stage = 30
+            p = ts.touch_point if ENABLE_MAIN_LOOP_TOUCH else None
+            # Only trigger events screen if not already active
+            if p and current_hour is not None and not (now < events_mode_until):
+                set_display_brightness(ACTIVE_BRIGHTNESS)
+                # Update the main screen clock label before showing events screen
+                update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
+                set_root_group(events_group)
+                # Switch immediately on touch; defer heavy text relayout to the events-view refresh path.
+                force_events_panel_refresh = True
+                last_events_update_second = current_second
+                last_events_update_minute = None
+                # Update the main screen clock before speech
+                update_idle_labels(current_hour, current_minute, current_day, current_month_short)
+                if (now - last_touch_speak_at) >= TOUCH_SPEAK_COOLDOWN_SECONDS:
+                    say_time(current_hour, current_minute)
+                    last_touch_speak_at = now
+                events_mode_until = now + 12
+
+            ui_stage = 40
+            if now < events_mode_until:
+                set_display_brightness(ACTIVE_BRIGHTNESS)
+                set_root_group(events_group)
+                if current_hour is not None and (
+                    force_events_panel_refresh or (current_minute != last_events_update_minute)
+                ):
+                    update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
+                    last_events_update_second = current_second
+                    last_events_update_minute = current_minute
+                    force_events_panel_refresh = False
+            else:
+                if (now - last_idle_brightness_update) >= 0.5:
+                    cached_idle_brightness = adaptive_idle_brightness(current_hour)
+                    last_idle_brightness_update = now
+                set_display_brightness(cached_idle_brightness)
+                set_root_group(idle_group)
+                last_events_update_second = None
+                last_events_update_minute = None
+                force_events_panel_refresh = True
+                if current_hour is None:
+                    set_idle_position(x, y)
+                else:
+                    if (now - last_idle_bounce_update) >= 0.10:
+                        bounce_idle_labels()
+                        last_idle_bounce_update = now
+        except MemoryError:
+            print("MEMERR ui_stage=%d free=%d alloc=%d" % (ui_stage, gc.mem_free(), gc.mem_alloc()))
+            gc.collect()
+            time.sleep(0.2)
+            continue
+    except Exception as e:
+        log_crash(e)
+        microcontroller.reset()
     if PERF_LOG_ENABLED and ((now - last_perf_log) >= PERF_LOG_INTERVAL_SECONDS):
         if loop_count_since_log <= 0:
             loop_hz = 0
