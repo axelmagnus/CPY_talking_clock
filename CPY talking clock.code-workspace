@@ -13,7 +13,7 @@
 			"reportMissingModuleSource": "none",
 			"reportShadowedImports": "none"
 		},
-		"circuitpython.board.version": "4.0.0-beta.5",
+		"circuitpython.board.version": "10.1.4",
 		"circuitpythonsync.cpbaseversion": "10",
 		"circuitpythonsync.cpfullversion": "10.1.4",
 		"circuitpythonsync.curlibtag": "20260310",
@@ -22,6 +22,7 @@
 			"/Users/axelmansson/.vscode/extensions/wmerkens.vscode-circuitpython-v2-0.3.4/stubs",
 			"/Users/axelmansson/Library/Application Support/Code/User/globalStorage/wmerkens.vscode-circuitpython-v2/bundle/20250319/adafruit-circuitpython-bundle-8.x-mpy-20250319/lib",
 			"/Users/axelmansson/Documents/CPY/PYP_feedcallback_get/libArchive/libstubs",
+			"/Users/axelmansson/Documents/GitHub/CPY talking clock/libArchive/libstubs",
 			"/Users/axelmansson/Library/Application Support/Code/User/globalStorage/padgettholdings.circuitpythonsync/stubs/circuitpython_stubs-10.1.4"
 		],
 		"circuitpythonsync.drivepath": "/Volumes/CIRCUITPY",

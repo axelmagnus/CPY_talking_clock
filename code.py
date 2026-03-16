@@ -285,9 +285,12 @@ GOOGLE_CALENDAR_IDS = [
 ]
 
 CALENDAR_COLORS = {
+    # axel månsson
     "axel.mansson@skola.malmo.se": 0x9F59B8,  # purple
+    # axel magnus mansson
     "axel.magnus.mansson@gmail.com": 0xFF6347,  # tomato red
-    "q53iida61vbpa37ft4lgeul80k@group.calendar.google.com": 0xFFB347,  # orange (Felix & Rufus)
+    # felix & rufus
+    "q53iida61vbpa37ft4lgeul80k@group.calendar.google.com": 0xFFB347,  # orange
 }
 
 DEBUG_TASKS = True
@@ -299,6 +302,15 @@ DIAG_LOG_PATH = "/diag_runtime.log"
 PERF_LOG_ENABLED = True
 PERF_LOG_INTERVAL_SECONDS = 30.0
 PERF_SYNC_LOG_ENABLED = True
+PERF_STALL_LOG_ENABLED = True
+PERF_STALL_THRESHOLD_MS = 800
+PERF_GC_LOG_THRESHOLD_MS = 250
+
+# Runtime perf logging can increase allocation pressure on constrained heaps.
+# Keep lightweight PERF/SYNC enabled, but leave verbose STALL logs off.
+PERF_LOG_ENABLED = True
+PERF_SYNC_LOG_ENABLED = True
+PERF_STALL_LOG_ENABLED = False
 
 
 def append_diag_line(line):
@@ -538,132 +550,6 @@ def _normalize_rfc3339_for_parser(dt_str):
     return dt_str[:19] + dt_str[tz_idx:]
 
 
-def get_tasks_list_api_url():
-    return "https://tasks.googleapis.com/tasks/v1/users/@me/lists"
-
-
-def get_tasks_items_api_url(tasklist_id):
-    tasklist_id_encoded = (
-        tasklist_id.replace("@", "%40")
-        .replace("/", "%2F")
-        .replace(" ", "%20")
-    )
-    return "https://tasks.googleapis.com/tasks/v1/lists/{}/tasks".format(tasklist_id_encoded)
-
-
-def fetch_week_tasks(offset_seconds, now_utc_epoch, max_rows=7):
-    access_token = get_google_access_token()
-    if not access_token or now_utc_epoch is None:
-        return []
-
-    now_local_epoch = now_utc_epoch + offset_seconds
-    now_local_tm = time.localtime(now_local_epoch)
-    start_today_local_epoch = time.mktime((
-        now_local_tm.tm_year,
-        now_local_tm.tm_mon,
-        now_local_tm.tm_mday,
-        0,
-        0,
-        0,
-        0,
-        -1,
-        -1,
-    ))
-    start_week_local_epoch = start_today_local_epoch - (now_local_tm.tm_wday * 86400)
-    end_week_local_epoch = start_week_local_epoch + (7 * 86400)
-
-    headers = {"Authorization": "Bearer %s" % access_token}
-    tasks = []
-    try:
-        lists_data = get_json_with_retry(get_tasks_list_api_url(), headers=headers)
-    except Exception:
-        return []
-
-    task_lists = lists_data.get("items", [])
-
-    dropped_completed = 0
-    dropped_no_due = 0
-    dropped_bad_due = 0
-    dropped_outside_week = 0
-
-    for tasklist in task_lists:
-        tasklist_id = tasklist.get("id")
-        if not tasklist_id:
-            continue
-        url = get_tasks_items_api_url(tasklist_id) + "?showCompleted=false&showHidden=false&maxResults=100"
-        try:
-            list_data = get_json_with_retry(url, headers=headers)
-        except Exception:
-            continue
-
-        list_items = list_data.get("items", [])
-
-        for task in list_items:
-            if task.get("status") == "completed":
-                dropped_completed += 1
-                continue
-            due_raw = task.get("due")
-            if not due_raw:
-                dropped_no_due += 1
-                continue
-            due_norm = _normalize_rfc3339_for_parser(due_raw)
-            try:
-                due_utc_epoch = rfc3339_to_epoch(due_norm)
-            except Exception:
-                dropped_bad_due += 1
-                continue
-
-            due_local_epoch = due_utc_epoch + offset_seconds
-            if due_local_epoch < start_today_local_epoch or due_local_epoch >= end_week_local_epoch:
-                dropped_outside_week += 1
-                continue
-
-            tasks.append(
-                {
-                    "due_utc_epoch": due_utc_epoch,
-                    "due_local_epoch": due_local_epoch,
-                    "title": task.get("title", "(No title)").strip() or "(No title)",
-                }
-            )
-
-    tasks.sort(key=lambda t: (t["due_utc_epoch"], t["title"]))
-
-    today_tasks = []
-    rest_tasks = []
-    for task in tasks:
-        due_tm = time.localtime(task["due_local_epoch"])
-        if (
-            due_tm.tm_year == now_local_tm.tm_year
-            and due_tm.tm_mon == now_local_tm.tm_mon
-            and due_tm.tm_mday == now_local_tm.tm_mday
-        ):
-            today_tasks.append(task)
-        else:
-            rest_tasks.append(task)
-
-    rows = []
-    if today_tasks and rest_tasks:
-        if len(today_tasks) >= max_rows:
-            selected_tasks = today_tasks[:max_rows]
-            for task in selected_tasks:
-                due_tm = time.localtime(task["due_local_epoch"])
-                rows.append(("%02d/%02d" % (due_tm.tm_mday, due_tm.tm_mon), _compact_words(task["title"], 19), 0xFFFFFF))
-        else:
-            for task in today_tasks:
-                due_tm = time.localtime(task["due_local_epoch"])
-                rows.append(("%02d/%02d" % (due_tm.tm_mday, due_tm.tm_mon), _compact_words(task["title"], 19), 0xFFFFFF))
-            if len(rows) < max_rows:
-                rows.append(("", "---------", 0x909090))
-            remaining = max_rows - len(rows)
-            for task in rest_tasks[:remaining]:
-                due_tm = time.localtime(task["due_local_epoch"])
-                rows.append(("%02d/%02d" % (due_tm.tm_mday, due_tm.tm_mon), _compact_words(task["title"], 19), 0xFFFFFF))
-    else:
-        for task in (today_tasks + rest_tasks)[:max_rows]:
-            due_tm = time.localtime(task["due_local_epoch"])
-            rows.append(("%02d/%02d" % (due_tm.tm_mday, due_tm.tm_mon), _compact_words(task["title"], 19), 0xFFFFFF))
-
-    return rows
 
 
 def log_main_screen_events(events):
@@ -1427,7 +1313,7 @@ def update_events_panel(events, hour, minute, day, month_short):
     events_time_label.text = "%02d:%02d" % (hour, minute)
     events_date_label.text = "%02d %s" % (day, month_short)
     events_alarm_label.text = alarm_text if alarm_text else ""
-    left_margin = 6
+    left_margin = 11
     bottom_margin = 8
     row_gap = 6
 
@@ -1455,7 +1341,7 @@ def update_events_panel(events, hour, minute, day, month_short):
             row_color = get_calendar_color(events[i].get("_calendar_id"))
             event_time_labels[i].text = hhmm
             time_w = event_time_labels[i].bounding_box[2] * event_time_labels[i].scale
-            event_time_labels[i].x = EVENT_TIME_RIGHT_X - time_w
+            event_time_labels[i].x = EVENT_TIME_RIGHT_X - time_w + 5
             event_title_labels[i].text = short_summary
             event_time_labels[i].color = row_color
             event_title_labels[i].color = row_color
@@ -1465,49 +1351,6 @@ def update_events_panel(events, hour, minute, day, month_short):
             event_title_labels[i].text = ""
 
 
-def update_tasks_panel(task_rows, hour, minute, day, month_short):
-    events_header.text = "Tasks"
-    events_time_label.text = "%02d:%02d" % (hour, minute)
-    events_date_label.text = "%02d %s" % (day, month_short)
-    events_alarm_label.text = alarm_text if alarm_text else ""
-    left_margin = 6
-    bottom_margin = 8
-    row_gap = 6
-
-    time_h = events_time_label.bounding_box[3] * events_time_label.scale
-    date_h = events_date_label.bounding_box[3] * events_date_label.scale
-    reserved_h = date_h if alarm_text else 0
-
-    block_top = board.DISPLAY.height - (time_h + row_gap + date_h + row_gap + reserved_h) - bottom_margin
-    events_time_label.x = left_margin
-    events_time_label.y = int(block_top + 7)
-    events_date_label.x = left_margin
-    events_date_label.y = int(block_top + time_h + row_gap + 1)
-    if alarm_text:
-        events_alarm_label.x = left_margin
-        events_alarm_label.y = int(events_date_label.y + date_h + row_gap)
-
-    pappa_button_bg.hidden = not pappavecka_active
-    pappa_button_label_top.hidden = not pappavecka_active
-    pappa_button_label_bottom.hidden = not pappavecka_active
-
-    visible_rows = task_rows
-    if not visible_rows:
-        visible_rows = [("", "No tasks this week", 0x909090)]
-
-    for i in range(EVENT_ROWS):
-        if i < len(visible_rows):
-            row_date, row_title, row_color = visible_rows[i]
-            event_time_labels[i].text = row_date
-            time_w = event_time_labels[i].bounding_box[2] * event_time_labels[i].scale
-            event_time_labels[i].x = EVENT_TIME_RIGHT_X - time_w
-            event_title_labels[i].text = row_title
-            event_time_labels[i].color = row_color
-            event_title_labels[i].color = row_color
-        else:
-            event_time_labels[i].text = ""
-            event_time_labels[i].x = EVENT_TIME_RIGHT_X
-            event_title_labels[i].text = ""
 
 
 def play_wav(filename):
@@ -1613,7 +1456,9 @@ def adaptive_idle_brightness(hour):
 
 # --- Main loop ---
 TIME_SYNC_INTERVAL = 15 * 60  # 15 min: keep events/alarms fresh during the day.
+CALENDAR_SYNC_INTERVAL = 15 * 60
 last_time_sync = 0
+last_calendar_sync = 0
 clock_base_monotonic = None
 clock_base_local_epoch = None
 current_hour = None
@@ -1621,9 +1466,19 @@ current_minute = None
 current_day = None
 current_month_short = None
 current_second = None
-events_mode_until = 0
+# Start with warmup disabled; warmup can trigger repeated allocation failures on tight heaps.
+events_mode_until = -1
 sync_reposition_pending = False
-last_idle_update_key = None
+last_idle_hour = None
+last_idle_minute = None
+last_idle_day = None
+last_idle_month_short = None
+last_idle_weather_current = None
+last_idle_weather_line1 = None
+last_idle_weather_line2 = None
+last_idle_weather_line3 = None
+last_idle_weather_line4 = None
+last_idle_alarm_text = None
 last_events_update_second = None
 last_events_update_minute = None
 force_events_panel_refresh = True
@@ -1633,6 +1488,12 @@ last_loop_now = None
 loop_count_since_log = 0
 loop_dt_max_ms = 0
 last_gc_collect = 0.0
+last_idle_bounce_update = 0.0
+last_idle_brightness_update = 0.0
+cached_idle_brightness = IDLE_BRIGHTNESS_SENSOR_FALLBACK
+last_touch_speak_at = -9999.0
+TOUCH_SPEAK_COOLDOWN_SECONDS = 2.5
+ENABLE_MAIN_LOOP_TOUCH = True
 
 
 def set_root_group(target_group):
@@ -1647,14 +1508,29 @@ while True:
 
     # Periodic GC helps reclaim short-lived network/UI allocations on constrained heaps.
     if (now - last_gc_collect) >= 20.0:
+        gc_t0 = time.monotonic()
         gc.collect()
         last_gc_collect = now
+        if PERF_STALL_LOG_ENABLED:
+            gc_ms = int((time.monotonic() - gc_t0) * 1000)
+            if gc_ms >= PERF_GC_LOG_THRESHOLD_MS:
+                print("GC ms=%d free=%d" % (gc_ms, gc.mem_free()))
 
     if PERF_LOG_ENABLED:
         if last_loop_now is not None:
             dt_ms = int((now - last_loop_now) * 1000)
             if dt_ms > loop_dt_max_ms:
                 loop_dt_max_ms = dt_ms
+            if PERF_STALL_LOG_ENABLED and dt_ms >= PERF_STALL_THRESHOLD_MS:
+                print(
+                    "STALL dt_ms=%d mode=%s free=%d ev=%d"
+                    % (
+                        dt_ms,
+                        "E" if active_root_group is events_group else "I",
+                        gc.mem_free(),
+                        len(events) if events else 0,
+                    )
+                )
         last_loop_now = now
         loop_count_since_log += 1
 
@@ -1685,15 +1561,21 @@ while True:
                 line4,
                 current_compact,
             )
-            refreshed_events = fetch_next_events()
-            t_cal1 = time.monotonic()
-            if refreshed_events or not events:
-                events = refreshed_events
-                if events:
-                    last_good_events = events
-            elif last_good_events:
-                # Keep most recent valid events if a transient refresh returns none.
-                events = last_good_events
+            refresh_calendar_now = (not events) or ((now - last_calendar_sync) > CALENDAR_SYNC_INTERVAL)
+            if refresh_calendar_now:
+                refreshed_events = fetch_next_events()
+                t_cal1 = time.monotonic()
+                if refreshed_events or not events:
+                    events = refreshed_events
+                    if events:
+                        last_good_events = events
+                elif last_good_events:
+                    # Keep most recent valid events if a transient refresh returns none.
+                    events = last_good_events
+                last_calendar_sync = now
+            else:
+                t_cal1 = time.monotonic()
+            gc.collect()
             log_main_screen_events(events)
             clock_base_monotonic = now
             last_time_sync = now
@@ -1805,60 +1687,88 @@ while True:
                     current_utc_epoch,
                 )
 
-    # One-time warmup of events panel once we have valid time/date.
-    if current_hour is not None and events_mode_until == 0:
-        prime_events_view(current_hour, current_minute, current_day, current_month_short)
-        events_mode_until = -1
+    ui_stage = 0
+    try:
+        # One-time warmup of events panel once we have valid time/date.
+        ui_stage = 10
+        if current_hour is not None and events_mode_until == 0:
+            prime_events_view(current_hour, current_minute, current_day, current_month_short)
+            events_mode_until = -1
 
-    if current_hour is not None:
-        idle_update_key = (
-            current_hour,
-            current_minute,
-            current_day,
-            current_month_short,
-            weather_current,
-            weather_line1,
-            weather_line2,
-            weather_line3,
-            weather_line4,
-            alarm_text,
-        )
-        if idle_update_key != last_idle_update_key:
-            update_idle_labels(current_hour, current_minute, current_day, current_month_short)
-            last_idle_update_key = idle_update_key
+        ui_stage = 20
+        if current_hour is not None:
+            idle_changed = (
+                (current_hour != last_idle_hour)
+                or (current_minute != last_idle_minute)
+                or (current_day != last_idle_day)
+                or (current_month_short != last_idle_month_short)
+                or (weather_current != last_idle_weather_current)
+                or (weather_line1 != last_idle_weather_line1)
+                or (weather_line2 != last_idle_weather_line2)
+                or (weather_line3 != last_idle_weather_line3)
+                or (weather_line4 != last_idle_weather_line4)
+                or (alarm_text != last_idle_alarm_text)
+            )
+            if idle_changed:
+                update_idle_labels(current_hour, current_minute, current_day, current_month_short)
+                last_idle_hour = current_hour
+                last_idle_minute = current_minute
+                last_idle_day = current_day
+                last_idle_month_short = current_month_short
+                last_idle_weather_current = weather_current
+                last_idle_weather_line1 = weather_line1
+                last_idle_weather_line2 = weather_line2
+                last_idle_weather_line3 = weather_line3
+                last_idle_weather_line4 = weather_line4
+                last_idle_alarm_text = alarm_text
 
-    p = ts.touch_point
-    if p and current_hour is not None:
-        set_display_brightness(ACTIVE_BRIGHTNESS)
-        update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
-        last_events_update_second = current_second
-        last_events_update_minute = current_minute
-        force_events_panel_refresh = False
-        set_root_group(events_group)
-        say_time(current_hour, current_minute)
-        events_mode_until = now + 12
-        time.sleep(1)
-
-    if now < events_mode_until:
-        set_display_brightness(ACTIVE_BRIGHTNESS)
-        set_root_group(events_group)
-        if current_hour is not None and (
-            force_events_panel_refresh or (current_minute != last_events_update_minute)
-        ):
+        ui_stage = 30
+        p = ts.touch_point if ENABLE_MAIN_LOOP_TOUCH else None
+        if p and current_hour is not None:
+            set_display_brightness(ACTIVE_BRIGHTNESS)
+            # Update the main screen clock label before showing events screen
             update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
+            set_root_group(events_group)
+            # Switch immediately on touch; defer heavy text relayout to the events-view refresh path.
+            force_events_panel_refresh = True
             last_events_update_second = current_second
-            last_events_update_minute = current_minute
-            force_events_panel_refresh = False
-    else:
-        set_display_brightness(adaptive_idle_brightness(current_hour))
-        set_root_group(idle_group)
-        last_events_update_second = None
-        last_events_update_minute = None
-        force_events_panel_refresh = True
-        if current_hour is None:
-            set_idle_position(x, y)
+            last_events_update_minute = None
+            if (now - last_touch_speak_at) >= TOUCH_SPEAK_COOLDOWN_SECONDS:
+                say_time(current_hour, current_minute)
+                last_touch_speak_at = now
+            events_mode_until = now + 12
+
+        ui_stage = 40
+        if now < events_mode_until:
+            set_display_brightness(ACTIVE_BRIGHTNESS)
+            set_root_group(events_group)
+            if current_hour is not None and (
+                force_events_panel_refresh or (current_minute != last_events_update_minute)
+            ):
+                update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
+                last_events_update_second = current_second
+                last_events_update_minute = current_minute
+                force_events_panel_refresh = False
         else:
-            bounce_idle_labels()
+            if (now - last_idle_brightness_update) >= 0.5:
+                cached_idle_brightness = adaptive_idle_brightness(current_hour)
+                last_idle_brightness_update = now
+            set_display_brightness(cached_idle_brightness)
+            set_root_group(idle_group)
+            last_events_update_second = None
+            last_events_update_minute = None
+            force_events_panel_refresh = True
+            if current_hour is None:
+                set_idle_position(x, y)
+            else:
+                if (now - last_idle_bounce_update) >= 0.10:
+                    bounce_idle_labels()
+                    last_idle_bounce_update = now
+    except MemoryError:
+        print("MEMERR ui_stage=%d free=%d alloc=%d" % (ui_stage, gc.mem_free(), gc.mem_alloc()))
+        gc.collect()
+        time.sleep(0.2)
+        continue
 
     if PERF_LOG_ENABLED and ((now - last_perf_log) >= PERF_LOG_INTERVAL_SECONDS):
         if loop_count_since_log <= 0:
