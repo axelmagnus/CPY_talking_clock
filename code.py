@@ -820,60 +820,60 @@ def run_alarm_until_touch(max_duration_seconds=30):
         audio.play(synth)
 
         # Air timing tuned from the test script; opening note intentionally shortened.
-        beat_seconds = 60.0 / 72.0
+        beat_seconds = 60.0 / 60.0  # Slower tempo (was 72 BPM, now 60 BPM)
         vibrato_rate_hz = 5.2
         vibrato_depth_cents = 10.0
         phrase = (
-            (78, 3.0, 0.14),
-            (78, 0.75, 0.13),
-            (83, 0.25, 0.12),
-            (79, 0.25, 0.12),
-            (76, 0.25, 0.12),
-            (74, 0.25, 0.12),
-            (73, 0.25, 0.12),
-            (74, 0.25, 0.12),
-            (73, 1.0, 0.12),
-            (69, 1.0, 0.11),
-            (81, 2.0, 0.13),
-            (81, 0.25, 0.12),
-            (78, 0.25, 0.12),
-            (72, 0.25, 0.11),
-            (71, 0.25, 0.11),
-            (76, 0.25, 0.12),
-            (75, 0.25, 0.11),
-            (81, 0.25, 0.12),
-            (79, 0.25, 0.12),
-            (79, 2.0, 0.12),
-            (78, 1.5, 0.12),
-            (79, 0.25, 0.11),
-            (81, 0.25, 0.11),
-            (74, 0.5, 0.10),
-            (74, 0.125, 0.10),
-            (76, 0.125, 0.10),
-            (78, 0.25, 0.11),
-            (76, 0.25, 0.11),
-            (76, 0.25, 0.11),
-            (74, 0.25, 0.11),
-            (73, 0.25, 0.11),
-            (71, 0.25, 0.11),
-            (69, 0.25, 0.11),
-            (81, 0.375, 0.12),
-            (78, 0.125, 0.11),
-            (72, 0.125, 0.10),
-            (71, 0.125, 0.10),
-            (76, 0.125, 0.11),
-            (75, 0.125, 0.10),
-            (81, 0.125, 0.11),
-            (79, 0.125, 0.11),
-            (79, 2.0, 0.12),
-            (73, 0.25, 0.11),
-            (71, 0.25, 0.11),
-            (71, 0.125, 0.11),
-            (73, 0.125, 0.11),
-            (74, 0.25, 0.11),
-            (73, 0.5, 0.11),
-            (71, 0.25, 0.11),
-            (69, 2.0, 0.11),
+            (78, 3.0, 0.11),
+            (78, 0.75, 0.10),
+            (83, 0.25, 0.09),
+            (79, 0.25, 0.09),
+            (76, 0.25, 0.09),
+            (74, 0.25, 0.09),
+            (73, 0.25, 0.09),
+            (74, 0.25, 0.09),
+            (73, 1.0, 0.09),
+            (69, 1.0, 0.08),
+            (81, 2.0, 0.10),
+            (81, 0.25, 0.09),
+            (78, 0.25, 0.09),
+            (72, 0.25, 0.08),
+            (71, 0.25, 0.08),
+            (76, 0.25, 0.09),
+            (75, 0.25, 0.08),
+            (81, 0.25, 0.09),
+            (79, 0.25, 0.09),
+            (79, 2.0, 0.09),
+            (78, 1.5, 0.09),
+            (79, 0.25, 0.08),
+            (81, 0.25, 0.08),
+            (74, 0.5, 0.07),
+            (74, 0.125, 0.07),
+            (76, 0.125, 0.07),
+            (78, 0.25, 0.08),
+            (76, 0.25, 0.08),
+            (76, 0.25, 0.08),
+            (74, 0.25, 0.08),
+            (73, 0.25, 0.08),
+            (71, 0.25, 0.08),
+            (69, 0.25, 0.08),
+            (81, 0.375, 0.09),
+            (78, 0.125, 0.08),
+            (72, 0.125, 0.07),
+            (71, 0.125, 0.07),
+            (76, 0.125, 0.08),
+            (75, 0.125, 0.07),
+            (81, 0.125, 0.08),
+            (79, 0.125, 0.08),
+            (79, 2.0, 0.09),
+            (73, 0.25, 0.08),
+            (71, 0.25, 0.08),
+            (71, 0.125, 0.08),
+            (73, 0.125, 0.08),
+            (74, 0.25, 0.08),
+            (73, 0.5, 0.08),
+            (71, 0.25, 0.08),
+            (69, 2.0, 0.08),
         )
 
         note_poll_sleep = 0.01
@@ -1341,7 +1341,7 @@ def update_events_panel(events, hour, minute, day, month_short):
             row_color = get_calendar_color(events[i].get("_calendar_id"))
             event_time_labels[i].text = hhmm
             time_w = event_time_labels[i].bounding_box[2] * event_time_labels[i].scale
-            event_time_labels[i].x = EVENT_TIME_RIGHT_X - time_w + 5
+            event_time_labels[i].x = EVENT_TIME_RIGHT_X - time_w
             event_title_labels[i].text = short_summary
             event_time_labels[i].color = row_color
             event_title_labels[i].color = row_color
@@ -1733,6 +1733,8 @@ while True:
             force_events_panel_refresh = True
             last_events_update_second = current_second
             last_events_update_minute = None
+            # Update the main screen clock before speech
+            update_idle_labels(current_hour, current_minute, current_day, current_month_short)
             if (now - last_touch_speak_at) >= TOUCH_SPEAK_COOLDOWN_SECONDS:
                 say_time(current_hour, current_minute)
                 last_touch_speak_at = now
