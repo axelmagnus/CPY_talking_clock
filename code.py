@@ -1,30 +1,9 @@
-# --- Crash protection: log and auto-restart on main loop exception ---
-import microcontroller
 
-# ...existing code...
-
-def log_crash(e):
-    try:
-        with open("/error.txt", "a") as f:
-            import traceback
-            f.write("\n--- Crash ---\n")
-            f.write(repr(e) + "\n")
-            f.write(traceback.format_exc())
-    except Exception:
-        pass
-
-# --- Main loop with crash protection ---
-while True:
-    try:
-        # ...existing main loop code...
-        break  # Remove or replace with your actual main loop logic
-    except Exception as e:
-        log_crash(e)
-        microcontroller.reset()
 # CircuitPython Talking Clock for PyPortal
 # Shows bouncing clock, speaks time on touch, and fetches next Google Calendar events.
 
 # --- Imports ---
+import microcontroller
 import time
 import os
 import random
@@ -47,18 +26,8 @@ from adafruit_bitmap_font import bitmap_font
 from weather_wmo_lookup import get_wmo_description
 from digitalio import DigitalInOut
 from adafruit_esp32spi import adafruit_esp32spi
-
-try:
-    import synthio
-    SYNTH_SIREN_AVAILABLE = True
-except ImportError:
-    synthio = None
-    SYNTH_SIREN_AVAILABLE = False
-
-try:
-    import audiopwmio
-except ImportError:
-    audiopwmio = None
+import synthio
+import adafruit_button
 
 # --- Network setup (ESP32 + WiFi) ---
 esp32_cs = DigitalInOut(board.ESP_CS)
@@ -779,8 +748,6 @@ def log_alarm_choice(alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_e
 
 
 def _open_speaker_audio_out():
-    if not SYNTH_SIREN_AVAILABLE:
-        return None
 
     # First try DAC path (AudioOut), which matches the working speech path on PyPortal.
     for pin_name in ("A0", "SPEAKER"):
@@ -809,12 +776,9 @@ def _open_speaker_audio_out():
             pass
     return None
 
-
 def run_alarm_until_touch(max_duration_seconds=30):
     # Gentle Bach-style wake phrase. Touch stops alarm; hard stop after max_duration_seconds.
-    if not SYNTH_SIREN_AVAILABLE:
-        return
-
+    
     audio = None
     synth = None
     current_note = None
@@ -834,7 +798,7 @@ def run_alarm_until_touch(max_duration_seconds=30):
             phase = (2.0 * math.pi * i) / 256.0
             sample = (
                 math.sin(phase)
-                + 0.33 * math.sin(2.0 * phase)
+                + 0.43 * math.sin(2.0 * phase)
                 + 0.16 * math.sin(3.0 * phase)
             )
             warm_wave[i] = int(sample * 21000)
@@ -849,53 +813,53 @@ def run_alarm_until_touch(max_duration_seconds=30):
         phrase = (
             (78, 3.0, 0.11),
             (78, 0.75, 0.10),
-            (83, 0.25, 0.09),
-            (79, 0.25, 0.09),
-            (76, 0.25, 0.09),
-            (74, 0.25, 0.09),
-            (73, 0.25, 0.09),
-            (74, 0.25, 0.09),
-            (73, 1.0, 0.09),
-            (69, 1.0, 0.08),
-            (81, 2.0, 0.10),
-            (81, 0.25, 0.09),
-            (78, 0.25, 0.09),
-            (72, 0.25, 0.08),
-            (71, 0.25, 0.08),
-            (76, 0.25, 0.09),
-            (75, 0.25, 0.08),
-            (81, 0.25, 0.09),
-            (79, 0.25, 0.09),
-            (79, 2.0, 0.09),
-            (78, 1.5, 0.09),
+            (83, 0.4, 0.09),
+            (79, 0.4, 0.09),
+            (76, 0.4, 0.09),
+            (74, 0.4, 0.09),
+            (73, 0.4, 0.09),
+            (74, 0.4, 0.09),
+            (73, 1.6, 0.09),
+            (69, 1.6, 0.08),
+            (81, 2.4, 0.10),
+            (81, 0.4, 0.09),
+            (78, 0.4, 0.09),
+            (72, 0.4, 0.08),
+            (71, 0.4, 0.08),
+            (76, 0.4, 0.09),
+            (75, 0.4, 0.08),
+            (81, 0.4, 0.09),
+            (79, 0.4, 0.09),
+            (79, 2.4, 0.09),
+            (78, 1.0, 0.09),
             (79, 0.25, 0.08),
             (81, 0.25, 0.08),
-            (74, 0.5, 0.07),
-            (74, 0.125, 0.07),
-            (76, 0.125, 0.07),
-            (78, 0.25, 0.08),
-            (76, 0.25, 0.08),
-            (76, 0.25, 0.08),
-            (74, 0.25, 0.08),
-            (73, 0.25, 0.08),
-            (71, 0.25, 0.08),
-            (69, 0.25, 0.08),
-            (81, 0.375, 0.09),
-            (78, 0.125, 0.08),
-            (72, 0.125, 0.07),
-            (71, 0.125, 0.07),
-            (76, 0.125, 0.08),
-            (75, 0.125, 0.07),
-            (81, 0.125, 0.08),
-            (79, 0.125, 0.08),
+            (74, 0.4, 0.07),
+            (74, 0.4, 0.07),
+            (76, 0.4, 0.07),
+            (78, 0.4, 0.08),
+            (76, 0.4, 0.08),
+            (76, 0.4, 0.08),
+            (74, 0.4, 0.08),
+            (73, 0.4, 0.08),
+            (71, 0.4, 0.08),
+            (69, 0.4, 0.08),
+            (81, 0.4, 0.09),
+            (78, 0.4, 0.08),
+            (72, 0.4, 0.07),
+            (71, 0.4, 0.07),
+            (76, 0.4, 0.08),
+            (75, 0.4, 0.07),
+            (81, 0.4, 0.08),
+            (79, 0.4, 0.08),
             (79, 2.0, 0.09),
+            (73, 0.4, 0.08),
+            (71, 0.4, 0.08),
+            (71, 0.25, 0.08),
             (73, 0.25, 0.08),
-            (71, 0.25, 0.08),
-            (71, 0.125, 0.08),
-            (73, 0.125, 0.08),
             (74, 0.25, 0.08),
-            (73, 0.5, 0.08),
-            (71, 0.25, 0.08),
+            (73, 0.6, 0.08),
+            (71, 0.4, 0.08),
             (69, 2.0, 0.08),
         )
 
@@ -959,63 +923,6 @@ def run_alarm_until_touch(max_duration_seconds=30):
         if audio:
             audio.deinit()
 
-
-def run_pwm_alarm_self_test(duration_seconds=2.0):
-    if not SYNTH_SIREN_AVAILABLE:
-        return
-
-    audio = None
-    synth = None
-    current_note = None
-    try:
-        audio = _open_speaker_audio_out()
-        if audio is None:
-            return
-        env = synthio.Envelope(
-            attack_time=0.01,
-            decay_time=0.08,
-            sustain_level=0.5,
-            release_time=0.12,
-        )
-        synth = synthio.Synthesizer(sample_rate=22050, envelope=env)
-        audio.play(synth)
-
-        # Soft two-step chime for boot diagnostics.
-        chime = (
-            ((71, 74, 78), 0.32, 0.16),
-            ((73, 76, 81), 0.32, 0.16),
-            ((74, 78, 83), 0.42, 0.15),
-        )
-
-        t_end = time.monotonic() + duration_seconds
-        while time.monotonic() < t_end:
-            for chord, duration, amp in chime:
-                if time.monotonic() >= t_end:
-                    break
-                notes = (
-                    synthio.Note(frequency=synthio.midi_to_hz(chord[0]), amplitude=amp),
-                    synthio.Note(frequency=synthio.midi_to_hz(chord[1]), amplitude=amp * 0.75),
-                    synthio.Note(frequency=synthio.midi_to_hz(chord[2]), amplitude=amp * 0.58),
-                )
-                current_note = notes
-                synth.press(notes)
-                time.sleep(duration)
-                synth.release(notes)
-                time.sleep(0.03)
-
-        if current_note is not None:
-            try:
-                synth.release(current_note)
-            except Exception:
-                pass
-        audio.stop()
-    except Exception:
-        pass
-    finally:
-        if audio:
-            audio.deinit()
-
-
 # --- Hardware UI/audio setup ---
 ts = adafruit_touchscreen.Touchscreen(
     board.TOUCH_XL,
@@ -1036,7 +943,7 @@ speaker_enable.direction = digitalio.Direction.OUTPUT
 speaker_enable.value = True
 #run_pwm_alarm_self_test()
 # Boot preview: play the current wake melody briefly so it can be auditioned.
-#run_alarm_until_touch(max_duration_seconds=24)
+#run_alarm_until_touch(max_duration_seconds=34)
 
 board.DISPLAY.auto_refresh = True
 
@@ -1160,52 +1067,31 @@ events_group.append(events_time_label)
 events_group.append(events_date_label)
 events_group.append(events_alarm_label)
 
+
 PAPPA_BUTTON_W = 148
 PAPPA_BUTTON_H = 75
 PAPPA_BUTTON_MARGIN = 10
 PAPPA_BUTTON_Y_OFFSET = 6
-pappa_button_bitmap = displayio.Bitmap(PAPPA_BUTTON_W, PAPPA_BUTTON_H, 2)
-pappa_button_palette = displayio.Palette(2)
-pappa_button_palette[0] = 0x000000
-pappa_button_palette.make_transparent(0)
-pappa_button_palette[1] = 0xFF8C00
 
-# Rounded rectangle shape: fill body with orange, keep corner pixels transparent.
-for py in range(PAPPA_BUTTON_H):
-    for px in range(PAPPA_BUTTON_W):
-        pappa_button_bitmap[px, py] = 1
-
-for cx, cy in ((0, 0), (PAPPA_BUTTON_W - 1, 0), (0, PAPPA_BUTTON_H - 1), (PAPPA_BUTTON_W - 1, PAPPA_BUTTON_H - 1)):
-    pappa_button_bitmap[cx, cy] = 0
-
-for cx, cy in ((1, 0), (0, 1), (PAPPA_BUTTON_W - 2, 0), (PAPPA_BUTTON_W - 1, 1), (0, PAPPA_BUTTON_H - 2), (1, PAPPA_BUTTON_H - 1), (PAPPA_BUTTON_W - 2, PAPPA_BUTTON_H - 1), (PAPPA_BUTTON_W - 1, PAPPA_BUTTON_H - 2)):
-    pappa_button_bitmap[cx, cy] = 0
-
-pappa_button_bg = displayio.TileGrid(
-    pappa_button_bitmap,
-    pixel_shader=pappa_button_palette,
-    x=board.DISPLAY.width - PAPPA_BUTTON_W - PAPPA_BUTTON_MARGIN,
-    y=board.DISPLAY.height - PAPPA_BUTTON_H - PAPPA_BUTTON_MARGIN + PAPPA_BUTTON_Y_OFFSET,
+button_x = board.DISPLAY.width - PAPPA_BUTTON_W - PAPPA_BUTTON_MARGIN
+button_y = board.DISPLAY.height - PAPPA_BUTTON_H - PAPPA_BUTTON_MARGIN + PAPPA_BUTTON_Y_OFFSET
+pappa_button = adafruit_button.Button(
+    x=button_x,
+    y=button_y,
+    width=PAPPA_BUTTON_W,
+    height=PAPPA_BUTTON_H,
+    style=adafruit_button.Button.ROUNDRECT,
+    label="",  # No label, we'll overlay our own
+    fill_color=0xFF8C00,
+    outline_color=0x000000,
 )
-pappa_button_label_top = label.Label(idle_font, text="PAPPA", color=0x000000)
-pappa_button_label_bottom = label.Label(idle_font, text="VECKA", color=0x000000)
-
-pappa_button_label_top.anchor_point = (0.5, 0.5)
-pappa_button_label_bottom.anchor_point = (0.5, 0.5)
-pappa_button_label_top.anchored_position = (
-    pappa_button_bg.x + (PAPPA_BUTTON_W // 2),
-    pappa_button_bg.y + int(PAPPA_BUTTON_H * 0.33),
-)
-pappa_button_label_bottom.anchored_position = (
-    pappa_button_bg.x + (PAPPA_BUTTON_W // 2),
-    pappa_button_bg.y + int(PAPPA_BUTTON_H * 0.70),
-)
-pappa_button_bg.hidden = True
-pappa_button_label_top.hidden = True
-pappa_button_label_bottom.hidden = True
-events_group.append(pappa_button_bg)
-events_group.append(pappa_button_label_top)
-events_group.append(pappa_button_label_bottom)
+# Overlay two custom labels
+pappa_label_top = label.Label(idle_font, text="PAPPA", color=0x000000)
+pappa_label_bottom = label.Label(idle_font, text="VECKA", color=0x000000)
+pappa_label_top.anchor_point = (0.5, 0.5)
+pappa_label_bottom.anchor_point = (0.5, 0.5)
+pappa_label_top.anchored_position = (button_x + PAPPA_BUTTON_W // 2, button_y + int(PAPPA_BUTTON_H * 0.3))
+pappa_label_bottom.anchored_position = (button_x + PAPPA_BUTTON_W // 2, button_y + int(PAPPA_BUTTON_H * 0.70))
 
 board.DISPLAY.root_group = idle_group
 try:
@@ -1354,9 +1240,24 @@ def update_events_panel(events, hour, minute, day, month_short):
         events_alarm_label.x = left_margin
         events_alarm_label.y = int(events_date_label.y + date_h + row_gap)
 
-    pappa_button_bg.hidden = not pappavecka_active
-    pappa_button_label_top.hidden = not pappavecka_active
-    pappa_button_label_bottom.hidden = not pappavecka_active
+    # Toggle pappa_button visibility by add/remove from events_group
+    try:
+        if pappavecka_active:
+            if pappa_button not in events_group:
+                events_group.append(pappa_button)
+            if pappa_label_top not in events_group:
+                events_group.append(pappa_label_top)
+            if pappa_label_bottom not in events_group:
+                events_group.append(pappa_label_bottom)
+        else:
+            if pappa_button in events_group:
+                events_group.remove(pappa_button)
+            if pappa_label_top in events_group:
+                events_group.remove(pappa_label_top)
+            if pappa_label_bottom in events_group:
+                events_group.remove(pappa_label_bottom)
+    except Exception as e:
+        pass
 
     for i in range(EVENT_ROWS):
         if i < len(events):
@@ -1372,8 +1273,6 @@ def update_events_panel(events, hour, minute, day, month_short):
             event_time_labels[i].text = ""
             event_time_labels[i].x = EVENT_TIME_RIGHT_X
             event_title_labels[i].text = ""
-
-
 
 
 def play_wav(filename):
@@ -1525,7 +1424,7 @@ def set_root_group(target_group):
         return
     board.DISPLAY.root_group = target_group
     active_root_group = target_group
-import microcontroller
+
 
 def log_crash(e):
     try:
@@ -1579,6 +1478,17 @@ while True:
                 t_time1 = time.monotonic()
                 line1, line2, line3, line4, current_compact = fetch_malmo_weather_lines()
                 t_weather1 = time.monotonic()
+                # Always fetch events together with time and weather
+                refreshed_events = fetch_next_events()
+                t_cal1 = time.monotonic()
+                if refreshed_events or not events:
+                    events = refreshed_events
+                    if events:
+                        last_good_events = events
+                elif last_good_events:
+                    # Keep most recent valid events if a transient refresh returns none.
+                    events = last_good_events
+                last_calendar_sync = now
                 (
                     clock_base_local_epoch,
                     current_utc_offset_seconds,
@@ -1596,20 +1506,6 @@ while True:
                     line4,
                     current_compact,
                 )
-                refresh_calendar_now = (not events) or ((now - last_calendar_sync) > CALENDAR_SYNC_INTERVAL)
-                if refresh_calendar_now:
-                    refreshed_events = fetch_next_events()
-                    t_cal1 = time.monotonic()
-                    if refreshed_events or not events:
-                        events = refreshed_events
-                        if events:
-                            last_good_events = events
-                    elif last_good_events:
-                        # Keep most recent valid events if a transient refresh returns none.
-                        events = last_good_events
-                    last_calendar_sync = now
-                else:
-                    t_cal1 = time.monotonic()
                 gc.collect()
                 log_main_screen_events(events)
                 clock_base_monotonic = now
@@ -1722,15 +1618,13 @@ while True:
                         current_utc_epoch,
                     )
 
-        ui_stage = 0
+
         try:
             # One-time warmup of events panel once we have valid time/date.
-            ui_stage = 10
             if current_hour is not None and events_mode_until == 0:
                 prime_events_view(current_hour, current_minute, current_day, current_month_short)
                 events_mode_until = -1
 
-            ui_stage = 20
             if current_hour is not None:
                 idle_changed = (
                     (current_hour != last_idle_hour)
@@ -1757,7 +1651,6 @@ while True:
                     last_idle_weather_line4 = weather_line4
                     last_idle_alarm_text = alarm_text
 
-            ui_stage = 30
             p = ts.touch_point if ENABLE_MAIN_LOOP_TOUCH else None
             # Only trigger events screen if not already active
             if p and current_hour is not None and not (now < events_mode_until):
