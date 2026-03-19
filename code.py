@@ -395,18 +395,22 @@ def fetch_next_events(max_results=7):
 
         now_epoch = int(data["unixtime"])
         offset_seconds = _parse_utc_offset_seconds(data.get("utc_offset", "+00:00"))
-        now_local_tm = time.localtime(now_epoch + offset_seconds)
+        now_local_epoch = now_epoch + offset_seconds
+        now_local_tm = time.localtime(now_local_epoch)
         # On weekends, look further ahead so Monday events are still listed.
         lookahead_hours = 72 if now_local_tm.tm_wday >= 5 else 24
-        max_epoch = now_epoch + lookahead_hours * 60 * 60
-        time_min = epoch_to_utc_iso(now_epoch)
-        time_max = epoch_to_utc_iso(max_epoch)
+        max_local_epoch = now_local_epoch + lookahead_hours * 60 * 60
+        # Use local time window for event inclusion
+        time_min = epoch_to_utc_iso(now_local_epoch - offset_seconds)
+        time_max = epoch_to_utc_iso(max_local_epoch - offset_seconds)
 
+        today_local_date = "%04d-%02d-%02d" % (now_local_tm.tm_year, now_local_tm.tm_mon, now_local_tm.tm_mday)
     except Exception:
         now_epoch = None
-        max_epoch = None
+        max_local_epoch = None
         time_min = CACHED_NOW_ISO
         time_max = None
+        today_local_date = None
 
     headers = {"Authorization": "Bearer %s" % access_token}
     merged_events = []
@@ -453,17 +457,28 @@ def fetch_next_events(max_results=7):
                     skipped_all_day += 1
                     continue
 
+
                 try:
                     event_epoch = rfc3339_to_epoch(start_dt)
                 except Exception:
                     skipped_parse += 1
                     continue
 
-                # Enforce exact now..now+24h window in code.
-                if now_epoch is not None and max_epoch is not None:
-                    if event_epoch < now_epoch or event_epoch > max_epoch:
-                        skipped_window += 1
-                        continue
+                # Convert event start to local time for window check
+                if now_local_epoch is not None and max_local_epoch is not None:
+                    event_local_epoch = event_epoch + offset_seconds
+                    event_local_tm = time.localtime(event_local_epoch)
+                    event_local_date = "%04d-%02d-%02d" % (event_local_tm.tm_year, event_local_tm.tm_mon, event_local_tm.tm_mday)
+                    # Show events if:
+                    # - They start after midnight local time today (even if before now, i.e. ongoing after midnight)
+                    # - And before the end of the window
+                    if (event_local_epoch < (now_local_epoch - (now_local_tm.tm_hour * 3600 + now_local_tm.tm_min * 60 + now_local_tm.tm_sec))) or (event_local_epoch > max_local_epoch):
+                        # But always include events from today (local date)
+                        if today_local_date is not None and event_local_date == today_local_date:
+                            pass  # include
+                        else:
+                            skipped_window += 1
+                            continue
 
                 event_key = start_dt + "|" + event.get("summary", "")
                 if event_key in seen:
@@ -592,13 +607,21 @@ def _local_epoch_to_date_str(local_epoch):
 def _add_days_local_date(date_str, days):
     return _local_epoch_to_date_str(_local_date_to_noon_epoch(date_str) + (days * 86400))
 
-
 def _is_pappavecka_extra_alarm_date(date_str):
+    print("[DEBUG] _is_pappavecka_extra_alarm_date called with:", date_str)
+    print("[DEBUG]   pappavecka_active:", pappavecka_active, "pappavecka_date:", pappavecka_date)
     if not (pappavecka_active and pappavecka_date):
+        print("[DEBUG]   Not active or no date, returning False")
         return False
     # Extra dad-week wake alarms are only on weekdays.
-    date_wday = time.localtime(_local_date_to_noon_epoch(date_str)).tm_wday
+    try:
+        date_wday = time.localtime(_local_date_to_noon_epoch(date_str)).tm_wday
+        print(f"[DEBUG]   date_wday for {date_str}: {date_wday}")
+    except Exception as e:
+        print("[DEBUG]   Exception in date_wday calculation:", repr(e))
+        return False
     if date_wday >= 5:
+        print(f"[DEBUG]   {date_str} is weekend (wday={date_wday}), returning False")
         return False
     # Dad-week extra wake alarm is Tue-Fri only.
     extra_dates = (
@@ -607,7 +630,11 @@ def _is_pappavecka_extra_alarm_date(date_str):
         _add_days_local_date(pappavecka_date, 3),
         _add_days_local_date(pappavecka_date, 4),
     )
-    return date_str in extra_dates
+    print(f"[DEBUG]   pappavecka_date: {pappavecka_date}")
+    print(f"[DEBUG]   extra_dates (Tue-Fri): {extra_dates}")
+    result = date_str in extra_dates
+    print(f"[DEBUG]   Is {date_str} in extra_dates? {result}")
+    return result
 
 
 MORNING_LIMIT_HOUR = 10  # Weekday first-event alarms before this hour.
@@ -617,27 +644,18 @@ WEEKEND_EVENT_ALARM_LEAD_MINUTES = 30
 
 
 def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
-    # Alarm is 15 minutes before the first upcoming event.
-    has_monday_mammavecka = mammavecka_active and mammavecka_date and is_local_date_monday(mammavecka_date)
-    candidates = []
+    try:
+        print("[DEBUG] schedule_alarm_from_events called")
+        print("[DEBUG]   pappavecka_active:", pappavecka_active, "pappavecka_date:", pappavecka_date)
+        print("[DEBUG]   mammavecka_active:", mammavecka_active, "mammavecka_date:", mammavecka_date)
+        print("[DEBUG]   now_utc_epoch:", now_utc_epoch)
+        has_monday_mammavecka = mammavecka_active and mammavecka_date and is_local_date_monday(mammavecka_date)
+        candidates = []
 
-    # Monday Mammavecka exception: still alarm at 07:20.
-    if has_monday_mammavecka:
-        mammavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(mammavecka_date, 7, 20, offset_seconds)
-        if now_utc_epoch is None:
-            candidates.append(
-                (
-                    mammavecka_alarm_utc_epoch,
-                    mammavecka_alarm_utc_epoch + 3600,
-                    "ALARM 07:20",
-                    "mammavecka|" + mammavecka_date,
-                )
-            )
-        else:
-            now_local_epoch = now_utc_epoch + offset_seconds
-            today_str = _local_epoch_to_date_str(now_local_epoch)
-            tomorrow_str = _local_epoch_to_date_str(now_local_epoch + 86400)
-            if mammavecka_date in (today_str, tomorrow_str) and ((mammavecka_alarm_utc_epoch + 3600) > now_utc_epoch):
+        # Monday Mammavecka exception: still alarm at 07:20.
+        if has_monday_mammavecka:
+            mammavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(mammavecka_date, 7, 20, offset_seconds)
+            if now_utc_epoch is None:
                 candidates.append(
                     (
                         mammavecka_alarm_utc_epoch,
@@ -646,97 +664,137 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
                         "mammavecka|" + mammavecka_date,
                     )
                 )
+            else:
+                now_local_epoch = now_utc_epoch + offset_seconds
+                today_str = _local_epoch_to_date_str(now_local_epoch)
+                tomorrow_str = _local_epoch_to_date_str(now_local_epoch + 86400)
+                if mammavecka_date in (today_str, tomorrow_str) and ((mammavecka_alarm_utc_epoch + 3600) > now_utc_epoch):
+                    candidates.append(
+                        (
+                            mammavecka_alarm_utc_epoch,
+                            mammavecka_alarm_utc_epoch + 3600,
+                            "ALARM 07:20",
+                            "mammavecka|" + mammavecka_date,
+                        )
+                    )
 
-    if events:
-        now_local_date = None
-        tomorrow_local_date = None
-        if now_utc_epoch is not None:
-            now_local_epoch = now_utc_epoch + offset_seconds
-            now_local_date = _local_epoch_to_date_str(now_local_epoch)
-            tomorrow_local_date = _local_epoch_to_date_str(now_local_epoch + 86400)
+        if events:
+            now_local_date = None
+            tomorrow_local_date = None
+            if now_utc_epoch is not None:
+                now_local_epoch = now_utc_epoch + offset_seconds
+                now_local_date = _local_epoch_to_date_str(now_local_epoch)
+                tomorrow_local_date = _local_epoch_to_date_str(now_local_epoch + 86400)
 
-        # Build first morning event per day; ignore later daytime events.
-        first_morning_event_by_date = {}
-        for event in events:
-            start_dt = event.get("start", {}).get("dateTime", "")
-            if not start_dt:
-                continue
-            try:
-                event_utc_epoch = rfc3339_to_epoch(start_dt)
-            except Exception:
-                continue
+            # Build first morning event per day; ignore later daytime events.
+            first_morning_event_by_date = {}
+            for event in events:
+                start_dt = event.get("start", {}).get("dateTime", "")
+                if not start_dt:
+                    continue
+                try:
+                    event_utc_epoch = rfc3339_to_epoch(start_dt)
+                except Exception:
+                    print(f"[DEBUG]   Failed to parse event start_dt: {start_dt}")
+                    continue
 
-            local_tm = time.localtime(int(event_utc_epoch + offset_seconds))
-            local_date = "%04d-%02d-%02d" % (local_tm.tm_year, local_tm.tm_mon, local_tm.tm_mday)
+                local_tm = time.localtime(int(event_utc_epoch + offset_seconds))
+                local_date = "%04d-%02d-%02d" % (local_tm.tm_year, local_tm.tm_mon, local_tm.tm_mday)
+                print(f"[DEBUG]   Event: {event.get('summary','')} start_dt: {start_dt} event_utc_epoch: {event_utc_epoch} local_date: {local_date} local_tm: {local_tm.tm_hour}:{local_tm.tm_min}")
 
-            # Only arm event alarms for today/tomorrow.
-            if now_local_date is not None and local_date not in (now_local_date, tomorrow_local_date):
-                continue
+                # Only arm event alarms for today/tomorrow.
+                if now_local_date is not None and local_date not in (now_local_date, tomorrow_local_date):
+                    print(f"[DEBUG]     Skipping event, not today/tomorrow: {local_date} (now_local_date={now_local_date}, tomorrow_local_date={tomorrow_local_date})")
+                    continue
 
-            limit_hour = WEEKEND_MORNING_LIMIT_HOUR if local_tm.tm_wday >= 5 else MORNING_LIMIT_HOUR
-            if local_tm.tm_hour >= limit_hour:
-                continue
+                limit_hour = WEEKEND_MORNING_LIMIT_HOUR if local_tm.tm_wday >= 5 else MORNING_LIMIT_HOUR
+                if local_tm.tm_hour >= limit_hour:
+                    print(f"[DEBUG]     Skipping event, after morning limit hour ({limit_hour}): {local_tm.tm_hour}:{local_tm.tm_min}")
+                    continue
 
-            current = first_morning_event_by_date.get(local_date)
-            if (current is None) or (event_utc_epoch < current[0]):
-                first_morning_event_by_date[local_date] = (event_utc_epoch, start_dt, event)
+                current = first_morning_event_by_date.get(local_date)
+                if (current is None) or (event_utc_epoch < current[0]):
+                    first_morning_event_by_date[local_date] = (event_utc_epoch, start_dt, event)
 
-        for _local_date, (first_event_epoch, first_start_dt, first_event) in first_morning_event_by_date.items():
-            if (now_utc_epoch is not None) and (first_event_epoch <= now_utc_epoch):
-                # After the first morning event has started, no more event alarm this day.
-                continue
+            for _local_date, (first_event_epoch, first_start_dt, first_event) in first_morning_event_by_date.items():
+                print(f"[DEBUG]   First morning event for {_local_date}: {first_event.get('summary','')} at {first_start_dt} (epoch {first_event_epoch})")
+                if (now_utc_epoch is not None) and (first_event_epoch <= now_utc_epoch):
+                    print(f"[DEBUG]     Skipping alarm, event already started: {first_event_epoch} <= {now_utc_epoch}")
+                    continue
 
-            lead_minutes = WEEKEND_EVENT_ALARM_LEAD_MINUTES if time.localtime(int(first_event_epoch + offset_seconds)).tm_wday >= 5 else WEEKDAY_EVENT_ALARM_LEAD_MINUTES
-            event_alarm_utc_epoch = first_event_epoch - (lead_minutes * 60)
-            event_key = first_start_dt + "|" + first_event.get("summary", "")
-            ah, am = utc_epoch_to_local_hhmm(event_alarm_utc_epoch, offset_seconds)
-            candidates.append(
-                (
-                    event_alarm_utc_epoch,
-                    first_event_epoch,
-                    "ALARM %02d:%02d" % (ah, am),
-                    event_key,
-                )
-            )
-
-    # Dad-week extra 07:20 alarm is additional, not a replacement.
-    if pappavecka_active and pappavecka_date:
-        if now_utc_epoch is None:
-            if _is_pappavecka_extra_alarm_date(pappavecka_date):
-                pappavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(pappavecka_date, 7, 20, offset_seconds)
+                lead_minutes = WEEKEND_EVENT_ALARM_LEAD_MINUTES if time.localtime(int(first_event_epoch + offset_seconds)).tm_wday >= 5 else WEEKDAY_EVENT_ALARM_LEAD_MINUTES
+                event_alarm_utc_epoch = first_event_epoch - (lead_minutes * 60)
+                event_key = first_start_dt + "|" + first_event.get("summary", "")
+                ah, am = utc_epoch_to_local_hhmm(event_alarm_utc_epoch, offset_seconds)
+                print(f"[DEBUG]     Adding event alarm: {event_alarm_utc_epoch} (ALARM %02d:%02d) for {event_key}" % (ah, am))
                 candidates.append(
                     (
-                        pappavecka_alarm_utc_epoch,
-                        pappavecka_alarm_utc_epoch + 3600,
-                        "ALARM 07:20",
-                        "pappavecka|" + pappavecka_date,
+                        event_alarm_utc_epoch,
+                        first_event_epoch,
+                        "ALARM %02d:%02d" % (ah, am),
+                        event_key,
                     )
                 )
-        else:
-            now_local_epoch = now_utc_epoch + offset_seconds
-            today_str = _local_epoch_to_date_str(now_local_epoch)
-            tomorrow_str = _local_epoch_to_date_str(now_local_epoch + 86400)
-            for extra_date in (today_str, tomorrow_str):
-                if not _is_pappavecka_extra_alarm_date(extra_date):
-                    continue
-                pappavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(extra_date, 7, 20, offset_seconds)
-                if (pappavecka_alarm_utc_epoch + 3600) > now_utc_epoch:
+
+        # Dad-week extra 07:20 alarm is additional, not a replacement.
+        if pappavecka_active and pappavecka_date:
+            print("[DEBUG]   Checking pappavecka extra alarm logic")
+            if now_utc_epoch is None:
+                if _is_pappavecka_extra_alarm_date(pappavecka_date):
+                    print("[DEBUG]   Adding pappavecka 07:20 alarm for:", pappavecka_date)
+                    pappavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(pappavecka_date, 7, 20, offset_seconds)
                     candidates.append(
                         (
                             pappavecka_alarm_utc_epoch,
                             pappavecka_alarm_utc_epoch + 3600,
                             "ALARM 07:20",
-                            "pappavecka|" + extra_date,
+                            "pappavecka|" + pappavecka_date,
                         )
                     )
+            else:
+                now_local_epoch = now_utc_epoch + offset_seconds
+                today_str = _local_epoch_to_date_str(now_local_epoch)
+                tomorrow_str = _local_epoch_to_date_str(now_local_epoch + 86400)
+                print("[DEBUG]   Checking extra alarm for:", today_str, tomorrow_str)
+                for extra_date in (today_str, tomorrow_str):
+                    if not _is_pappavecka_extra_alarm_date(extra_date):
+                        print("[DEBUG]     Not extra alarm date:", extra_date)
+                        continue
+                    pappavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(extra_date, 7, 20, offset_seconds)
+                    print("[DEBUG]     Considering alarm at:", pappavecka_alarm_utc_epoch, "for date:", extra_date)
+                    if (pappavecka_alarm_utc_epoch + 3600) > now_utc_epoch:
+                        print("[DEBUG]     Adding pappavecka 07:20 alarm for:", extra_date)
+                        candidates.append(
+                            (
+                                pappavecka_alarm_utc_epoch,
+                                pappavecka_alarm_utc_epoch + 3600,
+                                "ALARM 07:20",
+                                "pappavecka|" + extra_date,
+                            )
+                        )
+                    else:
+                        print("[DEBUG]     Skipping alarm, already passed for:", extra_date)
+        print("candidates:", candidates)
+        if not candidates:
+            print("[DEBUG] schedule_alarm_from_events: no alarm candidates found, returning early")
+            return None, None, "", None
 
-    if not candidates:
+        candidates.sort(key=lambda c: c[0])
+        selected = candidates[0]
+        # Patch: always return alarm text with date for next alarm
+        alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = selected
+        # Convert alarm_utc_epoch to local time (HH:MM only)
+        local_alarm_epoch = alarm_utc_epoch + offset_seconds
+        local_tm = time.localtime(int(local_alarm_epoch))
+        alarm_time_str = "%02d:%02d" % (local_tm.tm_hour, local_tm.tm_min)
+        alarm_text = f"ALARM {alarm_time_str}"
+        print(f"[DEBUG] alarm_text set to: {alarm_text}")
+        return alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key
+    except Exception as e:
+        print("[EXCEPTION] schedule_alarm_from_events crashed:", repr(e))
+        import sys
+        sys.print_exception(e)
         return None, None, "", None
-
-    candidates.sort(key=lambda c: c[0])
-    selected = candidates[0]
-    return selected
-
 
 def log_alarm_choice(alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key, offset_seconds, now_utc_epoch):
     _ = alarm_utc_epoch
@@ -1014,8 +1072,8 @@ idle_alarm_label.y = startup_y + startup_row1_h + 6 + ALARM_LABEL_Y_ADJUST
 startup_next_y = startup_y + startup_row1_h + 6 + startup_alarm_h + 6
 idle_weather_line1.x = startup_x
 idle_weather_line1.y = startup_next_y + WEATHER_Y_EXTRA
-idle_weather_line2.x = startup_x
-idle_weather_line2.y = idle_weather_line1.y + idle_weather_line1.bounding_box[3] * idle_weather_line1.scale + 4
+idle_weather_line2.x = startup_x + 3
+idle_weather_line2.y = idle_weather_line1.y  + idle_weather_line1.bounding_box[3] * idle_weather_line1.scale 
 idle_weather_line3.x = startup_x
 idle_weather_line3.y = idle_weather_line2.y + idle_weather_line2.bounding_box[3] * idle_weather_line2.scale + 4 + SUN_ROW_Y_ADJUST
 idle_weather_line4.x = startup_x
@@ -1125,7 +1183,8 @@ def update_idle_labels(hour, minute, day, month_short):
     global x, y, max_x, max_y
     idle_time_label.text = "%02d:%02d" % (hour, minute)
     idle_date_label.text = "%02d %s %s" % (day, month_short, weather_current)
-    idle_alarm_label.text = alarm_text if alarm_text else ""
+    # Always show the next scheduled alarm if available
+    idle_alarm_label.text = alarm_text if alarm_text else "ALARM --:--"
     idle_weather_line1.text = weather_line1
     idle_weather_line2.text = weather_line2
     # If precipitation start exists, keep it on row 3 and move sun to the last row.
@@ -1188,8 +1247,8 @@ def set_idle_position(px, py):
         idle_alarm_label.y = int(next_y + ALARM_LABEL_Y_ADJUST)
     idle_weather_line1.x = int(px)
     idle_weather_line1.y = int(next_y + WEATHER_Y_EXTRA)
-    idle_weather_line2.x = int(px)
-    idle_weather_line2.y = int(idle_weather_line1.y + idle_weather_line1.bounding_box[3] * idle_weather_line1.scale + 4)
+    idle_weather_line2.x = int(px) + 3
+    idle_weather_line2.y = int(idle_weather_line1.y + 25)
     idle_weather_line3.x = int(px)
     line3_gap = 4 + (PRECIP_ROW_Y_ADJUST if weather_line4 else 0)
     idle_weather_line3.y = int(idle_weather_line2.y + idle_weather_line2.bounding_box[3] * idle_weather_line2.scale + line3_gap + (0 if weather_line4 else SUN_ROW_Y_ADJUST))
@@ -1221,7 +1280,8 @@ def update_events_panel(events, hour, minute, day, month_short):
     events_header.text = "Events"
     events_time_label.text = "%02d:%02d" % (hour, minute)
     events_date_label.text = "%02d %s" % (day, month_short)
-    events_alarm_label.text = alarm_text if alarm_text else ""
+    # Always show the next scheduled alarm if available
+    events_alarm_label.text = alarm_text if alarm_text else "ALARM --:--"
     left_margin = 11
     bottom_margin = 8
     row_gap = 6
@@ -1602,8 +1662,8 @@ while True:
                 alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
                     events, current_utc_offset_seconds, current_utc_epoch
                 )
-                if alarm_event_utc_epoch is not None and current_utc_epoch >= alarm_event_utc_epoch:
-                    alarm_utc_epoch = None
+                # Only clear alarm_text if there are no upcoming alarms
+                if alarm_utc_epoch is None:
                     alarm_event_utc_epoch = None
                     alarm_text = ""
                     alarm_event_key = None
@@ -1724,3 +1784,4 @@ while True:
         loop_dt_max_ms = 0
 
     time.sleep(0.05)
+
