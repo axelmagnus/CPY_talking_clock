@@ -1560,6 +1560,10 @@ while True:
                     current_compact,
                 )
                 gc.collect()
+                # Compute current time components from synced clock_base_local_epoch
+                prepop_hour, prepop_minute, prepop_day, prepop_month_short = stockholm_components_from_epoch(clock_base_local_epoch)
+                print("populate events panel after sync")
+                update_events_panel(events, prepop_hour, prepop_minute, prepop_day, prepop_month_short)
                 log_main_screen_events(events)
                 clock_base_monotonic = now
                 last_time_sync = now
