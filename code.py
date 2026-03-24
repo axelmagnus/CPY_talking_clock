@@ -1,4 +1,3 @@
-
 # CircuitPython Talking Clock for PyPortal
 # Shows bouncing clock, speaks time on touch, and fetches next Google Calendar events.
 
@@ -18,6 +17,11 @@ import audioio
 import audiocore
 import terminalio
 import analogio
+try:
+    import traceback
+except ImportError:
+    print("traceback module not found; exception details will be limited")
+    traceback = None
 import adafruit_touchscreen
 import adafruit_requests
 import adafruit_connection_manager
@@ -387,6 +391,7 @@ def fetch_next_events(max_results=7):
     global pappavecka_active, pappavecka_date, mammavecka_active, mammavecka_date
     access_token = get_google_access_token()
     if not access_token:
+        print("No access token, aborting fetch_next_events")
         return []
     try:
         data = get_json_with_retry("http://time.now/developer/api/timezone/Europe/stockholm")
@@ -427,6 +432,8 @@ def fetch_next_events(max_results=7):
         if time_max:
             url += "&timeMax=%s" % time_max
 
+        print("\n[Calendar Fetch]", calendar_id)
+        print("URL:", url)
         try:
             data = get_json_with_retry(url, headers=headers)
             kept_for_calendar = 0
@@ -435,8 +442,7 @@ def fetch_next_events(max_results=7):
             skipped_parse = 0
             for event in data.get("items", []):
                 start = event.get("start", {})
-                summary = event.get("summary", "").strip()
-
+                summary = (event.get("summary") or "").strip()
                 # Track all-day week marker events, but keep them out of event rows.
                 if start.get("date") and summary.lower() == "pappavecka":
                     if pappavecka_date is None:
@@ -455,7 +461,6 @@ def fetch_next_events(max_results=7):
                     skipped_all_day += 1
                     continue
 
-
                 try:
                     event_epoch = rfc3339_to_epoch(start_dt)
                 except Exception:
@@ -467,16 +472,16 @@ def fetch_next_events(max_results=7):
                     event_local_epoch = event_epoch + offset_seconds
                     event_local_tm = time.localtime(event_local_epoch)
                     event_local_date = "%04d-%02d-%02d" % (event_local_tm.tm_year, event_local_tm.tm_mon, event_local_tm.tm_mday)
-                    # Show events if:
-                    # - They start after midnight local time today (even if before now, i.e. ongoing after midnight)
-                    # - And before the end of the window
-                    if (event_local_epoch < (now_local_epoch - (now_local_tm.tm_hour * 3600 + now_local_tm.tm_min * 60 + now_local_tm.tm_sec))) or (event_local_epoch > max_local_epoch):
-                        # But always include events from today (local date)
-                        if today_local_date is not None and event_local_date == today_local_date:
-                            pass  # include
-                        else:
-                            skipped_window += 1
-                            continue
+                    # Always include events for today and tomorrow
+                    tomorrow_local_epoch = now_local_epoch + 86400
+                    tomorrow_local_tm = time.localtime(tomorrow_local_epoch)
+                    tomorrow_local_date = "%04d-%02d-%02d" % (tomorrow_local_tm.tm_year, tomorrow_local_tm.tm_mon, tomorrow_local_tm.tm_mday)
+                    if (
+                        event_local_date != today_local_date
+                        and event_local_date != tomorrow_local_date
+                    ):
+                        skipped_window += 1
+                        continue
 
                 event_key = start_dt + "|" + event.get("summary", "")
                 if event_key in seen:
@@ -490,11 +495,24 @@ def fetch_next_events(max_results=7):
                     }
                 )
                 kept_for_calendar += 1
-
-        except Exception:
-            pass
+            print("Fetched:", len(data.get("items", [])), "Kept:", kept_for_calendar, "Skipped all-day:", skipped_all_day, "Skipped window:", skipped_window, "Skipped parse:", skipped_parse)
+        except Exception as e:
+            print("[ERROR] Fetch failed for", calendar_id, str(e))
 
     merged_events.sort(key=lambda event: seen.get(event.get("start", {}).get("dateTime", "") + "|" + event.get("summary", ""), 0))
+    # Print a short summary of the events that will be displayed
+    if merged_events:
+        print("Events displayed:")
+        for ev in merged_events[:max_results]:
+            dt = ev.get("start", {}).get("dateTime", "")
+            summary = ev.get("summary", "")
+            if len(dt) >= 16:
+                hhmm = dt[11:16]
+            else:
+                hhmm = "--:--"
+            print("{} {}".format(hhmm, summary[:24]))
+    else:
+        print("No events displayed.")
     return merged_events[:max_results]
 
 
@@ -553,8 +571,6 @@ def _normalize_rfc3339_for_parser(dt_str):
     if tz_idx == -1:
         return dt_str.split(".")[0]
     return dt_str[:19] + dt_str[tz_idx:]
-
-
 
 
 def log_main_screen_events(events):
@@ -635,7 +651,6 @@ WEEKEND_EVENT_ALARM_LEAD_MINUTES = 30
 
 def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
     try:
-        # ...existing code...
         has_monday_mammavecka = mammavecka_active and mammavecka_date and is_local_date_monday(mammavecka_date)
         candidates = []
 
@@ -686,7 +701,6 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
 
                 local_tm = time.localtime(int(event_utc_epoch + offset_seconds))
                 local_date = "%04d-%02d-%02d" % (local_tm.tm_year, local_tm.tm_mon, local_tm.tm_mday)
-                # ...existing code...
 
                 # Only arm event alarms for today/tomorrow.
                 if now_local_date is not None and local_date not in (now_local_date, tomorrow_local_date):
@@ -719,10 +733,8 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
 
         # Dad-week extra 07:20 alarm is additional, not a replacement.
         if pappavecka_active and pappavecka_date:
-            # ...existing code...
             if now_utc_epoch is None:
                 if _is_pappavecka_extra_alarm_date(pappavecka_date):
-                    pass
                     pappavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(pappavecka_date, 7, 20, offset_seconds)
                     candidates.append(
                         (
@@ -736,7 +748,6 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
                 now_local_epoch = now_utc_epoch + offset_seconds
                 today_str = _local_epoch_to_date_str(now_local_epoch)
                 tomorrow_str = _local_epoch_to_date_str(now_local_epoch + 86400)
-                # ...existing code...
                 for extra_date in (today_str, tomorrow_str):
                     if not _is_pappavecka_extra_alarm_date(extra_date):
                         print("[DEBUG]     Not extra alarm date:", extra_date)
@@ -760,23 +771,16 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
             print("[DEBUG] schedule_alarm_from_events: no alarm candidates found, returning early")
             return None, None, "", None
 
-        # If today is a pappavecka extra alarm date, always select the 07:20 alarm for today (if it exists and is in the future)
-        if pappavecka_active and pappavecka_date and now_utc_epoch is not None:
-            now_local_epoch = now_utc_epoch + offset_seconds
-            today_str = _local_epoch_to_date_str(now_local_epoch)
-            if _is_pappavecka_extra_alarm_date(today_str):
-                pappavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(today_str, 7, 20, offset_seconds)
-                # Only trigger if alarm is still in the future
-                if (pappavecka_alarm_utc_epoch + 3600) > now_utc_epoch:
-                    alarm_utc_epoch = pappavecka_alarm_utc_epoch
-                    alarm_event_utc_epoch = pappavecka_alarm_utc_epoch + 3600
-                    alarm_text = "ALARM 07:20"
-                    alarm_event_key = f"pappavecka|{today_str}"
-                    return alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key
         candidates.sort(key=lambda c: c[0])
-        selected = candidates[0]
+        selected = None
+        if now_utc_epoch is not None:
+            print("[DEBUG] schedule_alarm_from_events: filtering candidates for future alarms after:", now_utc_epoch)
+            future_candidates = [cand for cand in candidates if cand[0] > now_utc_epoch]
+            if future_candidates:
+                selected = future_candidates[0]
+        if selected is None:
+            return None, None, "", None
         alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = selected
-        # Convert alarm_utc_epoch to local time (HH:MM only)
         local_alarm_epoch = alarm_utc_epoch + offset_seconds
         local_tm = time.localtime(int(local_alarm_epoch))
         alarm_time_str = "%02d:%02d" % (local_tm.tm_hour, local_tm.tm_min)
@@ -1065,12 +1069,12 @@ idle_alarm_label.y = startup_y + startup_row1_h + 6 + ALARM_LABEL_Y_ADJUST
 startup_next_y = startup_y + startup_row1_h + 6 + startup_alarm_h + 6
 idle_weather_line1.x = startup_x
 idle_weather_line1.y = startup_next_y + WEATHER_Y_EXTRA
-idle_weather_line2.x = startup_x + 3
-idle_weather_line2.y = idle_weather_line1.y  + idle_weather_line1.bounding_box[3] * idle_weather_line1.scale 
+idle_weather_line2.x = startup_x + 1  # Move 2px left
+idle_weather_line2.y = idle_weather_line1.y  + idle_weather_line1.bounding_box[3] * idle_weather_line1.scale
 idle_weather_line3.x = startup_x
 idle_weather_line3.y = idle_weather_line2.y + idle_weather_line2.bounding_box[3] * idle_weather_line2.scale + 4 + SUN_ROW_Y_ADJUST
 idle_weather_line4.x = startup_x
-idle_weather_line4.y = idle_weather_line3.y + idle_weather_line3.bounding_box[3] * idle_weather_line3.scale + 4
+idle_weather_line4.y = idle_weather_line3.y + idle_weather_line3.bounding_box[3] * idle_weather_line3.scale + 7  # Move 3px down
 
 idle_group.append(idle_time_label)
 idle_group.append(idle_date_label)
@@ -1240,13 +1244,13 @@ def set_idle_position(px, py):
         idle_alarm_label.y = int(next_y + ALARM_LABEL_Y_ADJUST)
     idle_weather_line1.x = int(px)
     idle_weather_line1.y = int(next_y + WEATHER_Y_EXTRA)
-    idle_weather_line2.x = int(px) + 3
+    idle_weather_line2.x = int(px) + 1  # Align with startup, move 2px left
     idle_weather_line2.y = int(idle_weather_line1.y + 25)
     idle_weather_line3.x = int(px)
-    line3_gap = 4 + (PRECIP_ROW_Y_ADJUST if weather_line4 else 0)
+    line3_gap = 8 + (PRECIP_ROW_Y_ADJUST if weather_line4 else 0)
     idle_weather_line3.y = int(idle_weather_line2.y + idle_weather_line2.bounding_box[3] * idle_weather_line2.scale + line3_gap + (0 if weather_line4 else SUN_ROW_Y_ADJUST))
     idle_weather_line4.x = int(px)
-    idle_weather_line4.y = int(idle_weather_line3.y + idle_weather_line3.bounding_box[3] * idle_weather_line3.scale + 4 + (SUN_ROW_Y_ADJUST if weather_line4 else 0))
+    idle_weather_line4.y = int(idle_weather_line3.y + idle_weather_line3.bounding_box[3] * idle_weather_line3.scale + 7 + (SUN_ROW_Y_ADJUST if weather_line4 else 0))  # Move 3px down
 
 
 def bounce_idle_labels():
@@ -1482,12 +1486,24 @@ def set_root_group(target_group):
 def log_crash(e):
     try:
         with open("/error.txt", "a") as f:
-            import traceback
             f.write("\n--- Crash ---\n")
             f.write(repr(e) + "\n")
-            f.write(traceback.format_exc())
-    except Exception:
-        pass
+            # Try to write traceback if available
+            if traceback is not None:
+                try:
+                    f.write(traceback.format_exc())
+                except Exception:
+                    f.write("(traceback unavailable)\n")
+            else:
+                f.write("(traceback module not available)\n")
+            f.flush()
+    except Exception as file_exc:
+        # As a last resort, try to print to serial
+        try:
+            print("log_crash failed: ", repr(file_exc))
+            print("Original error: ", repr(e))
+        except Exception:
+            pass
 
 while True:
     try:
