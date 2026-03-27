@@ -3,6 +3,7 @@
 
 # --- Imports ---
 import microcontroller
+alarm_cycle_index = 0
 import time
 import os
 import random
@@ -221,7 +222,7 @@ def fetch_malmo_weather_lines():
         cur_app = current.get("apparent_temperature")
         current_compact = "--(--)"
         if cur_real is not None and cur_app is not None:
-            current_compact = "%d°(%d)" % (int(round(cur_real)), int(round(cur_app)))
+            current_compact = "%d°(%d°)" % (int(round(cur_real)), int(round(cur_app)))
         wmo_code = int(wmo_list[0]) if wmo_list else -1
         precip_sum = float(precip_sum_list[0]) if precip_sum_list else 0.0
         sunrise_hhmm = _iso_to_short_hhmm(sunrise_list[0]) if sunrise_list else "--:--"
@@ -257,7 +258,7 @@ def fetch_malmo_weather_lines():
                 precip_start_line = "%.1f mm: %02d-%02d" % (precip_amount, first_precip_hour, stop_precip_hour)
 
         return (
-            "Hi: %d°(%d) Lo: %d°(%d)" % (hi_real, hi_app, lo_real, lo_app),
+            "Hi: %d°(%d°) Lo: %d°(%d°)" % (hi_real, hi_app, lo_real, lo_app),
             "%s" % (desc,),
             "Sun: %s - %s" % (sunrise_hhmm, sunset_hhmm),
             precip_start_line,
@@ -433,7 +434,6 @@ def fetch_next_events(max_results=7):
             url += "&timeMax=%s" % time_max
 
         print("\n[Calendar Fetch]", calendar_id)
-        print("URL:", url)
         try:
             data = get_json_with_retry(url, headers=headers)
             kept_for_calendar = 0
@@ -1181,7 +1181,21 @@ def update_idle_labels(hour, minute, day, month_short):
     idle_time_label.text = "%02d:%02d" % (hour, minute)
     idle_date_label.text = "%02d %s %s" % (day, month_short, weather_current)
     # Always show the next scheduled alarm if available
-    idle_alarm_label.text = alarm_text if alarm_text else "ALARM --:--"
+    if alarm_text:
+        idle_alarm_label.text = alarm_text
+    else:
+        idle_alarm_label.text = "ALARM OFF"
+    # Update pappa_button label overlays
+    if pappavecka_active:
+        pappa_label_top.text = "PAPPA"
+        pappa_label_bottom.text = "VECKA"
+    else:
+        if alarm_text:
+            pappa_label_top.text = "ALARM"
+            pappa_label_bottom.text = alarm_text.split()[1]  # HH:mm
+        else:
+            pappa_label_top.text = "ALARM"
+            pappa_label_bottom.text = "OFF"
     idle_weather_line1.text = weather_line1
     idle_weather_line2.text = weather_line2
     # If precipitation start exists, keep it on row 3 and move sun to the last row.
@@ -1235,13 +1249,10 @@ def set_idle_position(px, py):
     idle_date_label.x = int(px + time_w + 10)
     idle_date_label.y = int(py + (row1_h - date_h) // 2)
     next_y = int(py + row1_h + 6)
-    if alarm_text:
-        idle_alarm_label.x = int(px)
-        idle_alarm_label.y = int(next_y + ALARM_LABEL_Y_ADJUST)
-        next_y = int(next_y + idle_alarm_label.bounding_box[3] * idle_alarm_label.scale + 6)
-    else:
-        idle_alarm_label.x = int(px)
-        idle_alarm_label.y = int(next_y + ALARM_LABEL_Y_ADJUST)
+    # Always reserve a row for the alarm label, regardless of alarm state
+    idle_alarm_label.x = int(px)
+    idle_alarm_label.y = int(next_y + ALARM_LABEL_Y_ADJUST)
+    next_y = int(next_y + idle_alarm_label.bounding_box[3] * idle_alarm_label.scale + 6)
     idle_weather_line1.x = int(px)
     idle_weather_line1.y = int(next_y + WEATHER_Y_EXTRA)
     idle_weather_line2.x = int(px) + 1  # Align with startup, move 2px left
@@ -1278,43 +1289,182 @@ def update_events_panel(events, hour, minute, day, month_short):
     events_time_label.text = "%02d:%02d" % (hour, minute)
     events_date_label.text = "%02d %s" % (day, month_short)
     # Always show the next scheduled alarm if available
-    events_alarm_label.text = alarm_text if alarm_text else "ALARM --:--"
+    if alarm_text:
+        events_alarm_label.text = alarm_text
+    else:
+        events_alarm_label.text = "ALARM OFF"
     left_margin = 11
     bottom_margin = 8
     row_gap = 6
 
-    # Keep one extra row reserved below date for alarm row when active.
+    # Always reserve a row for the alarm label, regardless of alarm state
     time_h = events_time_label.bounding_box[3] * events_time_label.scale
     date_h = events_date_label.bounding_box[3] * events_date_label.scale
-    reserved_h = date_h if alarm_text else 0
+    reserved_h = date_h  # Always reserve space for alarm row
 
     block_top = board.DISPLAY.height - (time_h + row_gap + date_h + row_gap + reserved_h) - bottom_margin
     events_time_label.x = left_margin-2
     events_time_label.y = int(block_top + 7)
     events_date_label.x = left_margin
     events_date_label.y = int(block_top + time_h + row_gap + 1)
-    if alarm_text:
-        events_alarm_label.x = left_margin
-        events_alarm_label.y = int(events_date_label.y + date_h + row_gap)
+    events_alarm_label.x = left_margin
+    events_alarm_label.y = int(events_date_label.y + date_h + row_gap)
 
-    # Toggle pappa_button visibility by add/remove from events_group
+    # Always show pappa_button and overlays in events_group
     try:
+        if pappa_button not in events_group:
+            events_group.append(pappa_button)
+        if pappa_label_top not in events_group:
+            events_group.append(pappa_label_top)
+        if pappa_label_bottom not in events_group:
+            events_group.append(pappa_label_bottom)
+        # Update overlays
         if pappavecka_active:
-            if pappa_button not in events_group:
-                events_group.append(pappa_button)
-            if pappa_label_top not in events_group:
-                events_group.append(pappa_label_top)
-            if pappa_label_bottom not in events_group:
-                events_group.append(pappa_label_bottom)
+            pappa_label_top.text = "PAPPA"
+            pappa_label_bottom.text = "VECKA"
         else:
-            if pappa_button in events_group:
-                events_group.remove(pappa_button)
-            if pappa_label_top in events_group:
-                events_group.remove(pappa_label_top)
-            if pappa_label_bottom in events_group:
-                events_group.remove(pappa_label_bottom)
-    except Exception as e:
+            if alarm_text:
+                pappa_label_top.text = "ALARM"
+                pappa_label_bottom.text = alarm_text.split()[1]  # HH:mm
+            else:
+                pappa_label_top.text = "ALARM"
+                pappa_label_bottom.text = "OFF"
+    except Exception:
         pass
+
+    # Populate event rows
+    for i in range(EVENT_ROWS):
+        if i < len(events):
+            hhmm, short_summary = format_event_compact(events[i])
+            row_color = get_calendar_color(events[i].get("_calendar_id"))
+            event_time_labels[i].text = hhmm
+            time_w = event_time_labels[i].bounding_box[2] * event_time_labels[i].scale
+            event_time_labels[i].x = EVENT_TIME_RIGHT_X - time_w
+            event_title_labels[i].text = short_summary
+            event_time_labels[i].color = row_color
+            event_title_labels[i].color = row_color
+        else:
+            event_time_labels[i].text = ""
+            event_time_labels[i].x = EVENT_TIME_RIGHT_X
+            event_title_labels[i].text = ""
+last_canceled_alarm_event_key = None
+
+def cancel_next_alarm_and_reschedule():
+    global alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key, alarm_fired_for_key, events, last_canceled_alarm_event_key, alarm_cycle_index
+    # Remove the first alarm candidate and reschedule
+    # Use the same logic as schedule_alarm_from_events, but skip the first candidate
+    offset_seconds = current_utc_offset_seconds
+    now_utc_epoch = None
+    try:
+        now = time.monotonic()
+        if (clock_base_local_epoch is not None) and (clock_base_monotonic is not None):
+            elapsed = int(now - clock_base_monotonic)
+            current_local_epoch = clock_base_local_epoch + elapsed
+            now_utc_epoch = current_local_epoch - current_utc_offset_seconds
+    except Exception:
+        pass
+    # Get all alarm candidates
+    try:
+        candidates = []
+        # --- Begin candidate logic ---
+        has_monday_mammavecka = mammavecka_active and mammavecka_date and is_local_date_monday(mammavecka_date)
+        if has_monday_mammavecka:
+            mammavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(mammavecka_date, 7, 20, offset_seconds)
+            now_local_epoch = now_utc_epoch + offset_seconds if now_utc_epoch is not None else None
+            today_str = _local_epoch_to_date_str(now_local_epoch) if now_local_epoch else None
+            tomorrow_str = _local_epoch_to_date_str(now_local_epoch + 86400) if now_local_epoch else None
+            if mammavecka_date in (today_str, tomorrow_str) and ((mammavecka_alarm_utc_epoch + 3600) > (now_utc_epoch or 0)):
+                candidates.append((mammavecka_alarm_utc_epoch, mammavecka_alarm_utc_epoch + 3600, "ALARM 07:20", "mammavecka|" + mammavecka_date))
+        if events:
+            now_local_date = None
+            tomorrow_local_date = None
+            if now_utc_epoch is not None:
+                now_local_epoch = now_utc_epoch + offset_seconds
+                now_local_date = _local_epoch_to_date_str(now_local_epoch)
+                tomorrow_local_date = _local_epoch_to_date_str(now_local_epoch + 86400)
+            first_morning_event_by_date = {}
+            for event in events:
+                start_dt = event.get("start", {}).get("dateTime", "")
+                if not start_dt:
+                    continue
+                try:
+                    event_utc_epoch = rfc3339_to_epoch(start_dt)
+                except Exception:
+                    continue
+                local_tm = time.localtime(int(event_utc_epoch + offset_seconds))
+                local_date = "%04d-%02d-%02d" % (local_tm.tm_year, local_tm.tm_mon, local_tm.tm_mday)
+                if now_local_date is not None and local_date not in (now_local_date, tomorrow_local_date):
+                    continue
+                limit_hour = WEEKEND_MORNING_LIMIT_HOUR if local_tm.tm_wday >= 5 else MORNING_LIMIT_HOUR
+                if local_tm.tm_hour >= limit_hour:
+                    continue
+                current = first_morning_event_by_date.get(local_date)
+                if (current is None) or (event_utc_epoch < current[0]):
+                    first_morning_event_by_date[local_date] = (event_utc_epoch, start_dt, event)
+            for _local_date, (first_event_epoch, first_start_dt, first_event) in first_morning_event_by_date.items():
+                if (now_utc_epoch is not None) and (first_event_epoch <= now_utc_epoch):
+                    continue
+                lead_minutes = WEEKEND_EVENT_ALARM_LEAD_MINUTES if time.localtime(int(first_event_epoch + offset_seconds)).tm_wday >= 5 else WEEKDAY_EVENT_ALARM_LEAD_MINUTES
+                event_alarm_utc_epoch = first_event_epoch - (lead_minutes * 60)
+                event_key = first_start_dt + "|" + first_event.get("summary", "")
+                ah, am = utc_epoch_to_local_hhmm(event_alarm_utc_epoch, offset_seconds)
+                candidates.append((event_alarm_utc_epoch, first_event_epoch, f"ALARM {ah:02d}:{am:02d}", event_key))
+        if pappavecka_active and pappavecka_date:
+            now_local_epoch = now_utc_epoch + offset_seconds if now_utc_epoch is not None else None
+            today_str = _local_epoch_to_date_str(now_local_epoch) if now_local_epoch else None
+            tomorrow_str = _local_epoch_to_date_str(now_local_epoch + 86400) if now_local_epoch else None
+            for extra_date in (today_str, tomorrow_str):
+                if not _is_pappavecka_extra_alarm_date(extra_date):
+                    continue
+                pappavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(extra_date, 7, 20, offset_seconds)
+                if (pappavecka_alarm_utc_epoch + 3600) > (now_utc_epoch or 0):
+                    candidates.append((pappavecka_alarm_utc_epoch, pappavecka_alarm_utc_epoch + 3600, "ALARM 07:20", "pappavecka|" + extra_date))
+        candidates.sort(key=lambda c: c[0])
+        num_alarms = len(candidates)
+        # Only reset index if out of range (e.g. after event sync)
+        if alarm_cycle_index > num_alarms:
+            alarm_cycle_index = 0
+        # Advance index for cycling
+        alarm_cycle_index = (alarm_cycle_index + 1) % (num_alarms + 1)
+        if num_alarms == 0 or alarm_cycle_index == num_alarms:
+            alarm_utc_epoch = None
+            alarm_event_utc_epoch = None
+            alarm_text = ""
+            alarm_event_key = None
+        else:
+            alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = candidates[alarm_cycle_index]
+            local_alarm_epoch = alarm_utc_epoch + offset_seconds
+            local_tm = time.localtime(int(local_alarm_epoch))
+            alarm_time_str = "%02d:%02d" % (local_tm.tm_hour, local_tm.tm_min)
+            alarm_text = f"ALARM {alarm_time_str}"
+        alarm_fired_for_key = None
+    except Exception as e:
+        alarm_utc_epoch = None
+        alarm_event_utc_epoch = None
+        alarm_text = ""
+        alarm_event_key = None
+        alarm_fired_for_key = None
+    # Update UI
+    if current_hour is not None:
+        update_idle_labels(current_hour, current_minute, current_day, current_month_short)
+        update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
+
+def check_pappa_button_press(p):
+    # p is a touch point (x, y)
+    if p is None:
+        return False
+    bx, by = pappa_button.x, pappa_button.y
+    bw, bh = pappa_button.width, pappa_button.height
+    # Only allow alarm cycling if the main (events) screen is active
+    if bx <= p[0] <= bx + bw and by <= p[1] <= by + bh:
+        if active_root_group is events_group:
+            global alarm_text
+            alarm_text = ""
+            cancel_next_alarm_and_reschedule()
+            update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
+            update_idle_labels(current_hour, current_minute, current_day, current_month_short)
+            return True
+    return False
 
     for i in range(EVENT_ROWS):
         if i < len(events):
@@ -1725,8 +1875,12 @@ while True:
                     last_idle_alarm_text = alarm_text
 
             p = ts.touch_point if ENABLE_MAIN_LOOP_TOUCH else None
+            # Check pappa_button press first
+            if p is not None and check_pappa_button_press(p):
+                # Already handled alarm cancel, do not switch screen
+                pass
             # Only trigger events screen if not already active
-            if p and current_hour is not None and not (now < events_mode_until):
+            elif p and current_hour is not None and not (now < events_mode_until):
                 set_display_brightness(ACTIVE_BRIGHTNESS)
                 # Update the main screen clock label before showing events screen
                 update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
@@ -1781,17 +1935,17 @@ while True:
             loop_hz = 0
         else:
             loop_hz = int(loop_count_since_log / PERF_LOG_INTERVAL_SECONDS)
-        print(
-            "PERF free=%d alloc=%d ev=%d mode=%s hz=%d dt_max_ms=%d"
-            % (
-                gc.mem_free(),
-                gc.mem_alloc(),
-                len(events) if events else 0,
-                "E" if active_root_group is events_group else "I",
-                loop_hz,
-                loop_dt_max_ms,
-            )
-        )
+        # print(
+        #     "PERF free=%d alloc=%d ev=%d mode=%s hz=%d dt_max_ms=%d"
+        #     % (
+        #         gc.mem_free(),
+        #         gc.mem_alloc(),
+        #         len(events) if events else 0,
+        #         "E" if active_root_group is events_group else "I",
+        #         loop_hz,
+        #         loop_dt_max_ms,
+        #     )
+        #)
         last_perf_log = now
         loop_count_since_log = 0
         loop_dt_max_ms = 0
