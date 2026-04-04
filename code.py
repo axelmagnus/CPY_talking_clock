@@ -580,6 +580,21 @@ CALENDAR_COLORS = {
     "q53iida61vbpa37ft4lgeul80k@group.calendar.google.com": 0xFFB347,  # orange
 }
 
+# Local overrides for events that do not expose colorId via API.
+# Keys are lowercase event summaries.
+LOCAL_EVENT_COLOR_OVERRIDES = {
+    "test sage green am": 0x57B587,
+}
+
+# Prefer ID-based overrides because summaries can change.
+# Populate these from serial logs: eventId is printed in Events displayed.
+LOCAL_EVENT_COLOR_OVERRIDES_BY_EVENT_ID = {
+    # test sage green AM
+    "1m24c84l0japmhui91ludlorav": 0x57B587,
+    # am red
+    "23venv814bnmepf36a0pocmmc2": 0xDC2127,
+}
+
 DIAG_ENABLED = False
 DIAG_LABEL_ENABLED = False
 DIAG_SAMPLE_INTERVAL_SECONDS = 20.0
@@ -621,6 +636,15 @@ def get_calendar_events_api_url(calendar_id):
 
 def get_calendar_color(calendar_id):
     return CALENDAR_COLORS.get(calendar_id, 0xFFFFFF)
+
+
+def get_local_event_override_color(event):
+    event_id = event.get("id")
+    if event_id in LOCAL_EVENT_COLOR_OVERRIDES_BY_EVENT_ID:
+        return LOCAL_EVENT_COLOR_OVERRIDES_BY_EVENT_ID[event_id]
+
+    summary_key = (event.get("summary") or "").strip().lower()
+    return LOCAL_EVENT_COLOR_OVERRIDES.get(summary_key)
 
 
 def rfc3339_to_epoch(dt_str):
@@ -779,6 +803,7 @@ def fetch_next_events(max_results=7):
                 seen[event_key] = event_epoch
                 merged_events.append(
                     {
+                        "id": event.get("id"),
                         "start": {"dateTime": start_dt},
                         "summary": summary if summary else "(No title)",
                         "_calendar_id": calendar_id,
@@ -797,11 +822,24 @@ def fetch_next_events(max_results=7):
         for ev in merged_events[:max_results]:
             dt = ev.get("start", {}).get("dateTime", "")
             summary = ev.get("summary", "")
+            event_id = ev.get("id")
+            color_id = ev.get("colorId")
+            calendar_color = get_calendar_color(ev.get("_calendar_id"))
+            override_color = get_local_event_override_color(ev)
             if len(dt) >= 16:
                 hhmm = dt[11:16]
             else:
                 hhmm = "--:--"
-            print("{} {}".format(hhmm, summary[:24]))
+            print(
+                "{} {} id={} colorId={} localColor={} calColor=0x{:06X}".format(
+                    hhmm,
+                    summary[:24],
+                    event_id,
+                    color_id,
+                    "0x{:06X}".format(override_color) if override_color is not None else "None",
+                    calendar_color,
+                )
+            )
     else:
         print("No events displayed.")
     return merged_events[:max_results]
@@ -941,6 +979,7 @@ WEEKEND_EVENT_ALARM_LEAD_MINUTES = 30
 
 
 def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
+    global alarm_cycle_index
     try:
         has_monday_mammavecka = mammavecka_active and mammavecka_date and is_local_date_monday(mammavecka_date)
         candidates = []
@@ -1047,15 +1086,21 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
         print("candidates:", candidates)
         if not candidates:
             print("[DEBUG] schedule_alarm_from_events: no alarm candidates found, returning early")
+            alarm_cycle_index = 0
             return None, None, "", None
 
         candidates.sort(key=lambda c: c[0])
         selected = None
+        selected_candidates = candidates
         if now_utc_epoch is not None:
             print("[DEBUG] schedule_alarm_from_events: filtering candidates for future alarms after:", now_utc_epoch)
-            future_candidates = [cand for cand in candidates if cand[0] > now_utc_epoch]
-            if future_candidates:
-                selected = future_candidates[0]
+            selected_candidates = [cand for cand in candidates if cand[0] > now_utc_epoch]
+        if not selected_candidates:
+            alarm_cycle_index = 0
+            return None, None, "", None
+        if alarm_cycle_index >= len(selected_candidates):
+            alarm_cycle_index = 0
+        selected = selected_candidates[alarm_cycle_index]
         if selected is None:
             return None, None, "", None
         alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = selected
@@ -1610,6 +1655,8 @@ def update_events_panel(events, hour, minute, day, month_short):
             color_id = events[i].get('colorId')
             if color_id and color_id in EVENT_COLORS:
                 row_color = EVENT_COLORS[color_id]
+            elif get_local_event_override_color(events[i]) is not None:
+                row_color = get_local_event_override_color(events[i])
             else:
                 row_color = get_calendar_color(events[i].get("_calendar_id"))
             event_time_labels[i].text = hhmm
