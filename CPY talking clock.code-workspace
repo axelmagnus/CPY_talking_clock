@@ -27,6 +27,7 @@
 		],
 		"circuitpythonsync.drivepath": "/Volumes/CIRCUITPY",
 		"circuitpython.board.vid": "0x239A",
-		"circuitpython.board.pid": "0x8036"
+		"circuitpython.board.pid": "0x8036",
+		"circuitpythonsync.doNotShowWelcome": true
 	}
 }
