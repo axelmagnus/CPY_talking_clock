@@ -580,6 +580,13 @@ CALENDAR_COLORS = {
     "q53iida61vbpa37ft4lgeul80k@group.calendar.google.com": 0xFFB347,  # orange
 }
 
+# Google Calendar event color palette.
+EVENT_COLORS = {
+    '1': 0xA4BDFC, '2': 0x7AE7BF, '3': 0xDBADFF, '4': 0xFF887C, '5': 0xFBD75B,
+    '6': 0xFFB878, '7': 0x46D6DB, '8': 0xE1E1E1, '9': 0x5484ED, '10': 0x51B749,
+    '11': 0xDC2127
+}
+
 # Local overrides for events that do not expose colorId via API.
 # Keys are lowercase event summaries.
 LOCAL_EVENT_COLOR_OVERRIDES = {
@@ -611,6 +618,8 @@ PERF_GC_LOG_THRESHOLD_MS = 250
 PERF_LOG_ENABLED = True
 PERF_SYNC_LOG_ENABLED = True
 PERF_STALL_LOG_ENABLED = False
+ALARM_DEBUG = False
+EVENT_FETCH_DEBUG = False
 
 
 def append_diag_line(line):
@@ -747,7 +756,8 @@ def fetch_next_events(max_results=7):
         if time_max:
             url += "&timeMax=%s" % time_max
 
-        print("\n[Calendar Fetch]", calendar_id)
+        if EVENT_FETCH_DEBUG:
+            print("\n[Calendar Fetch]", calendar_id)
         try:
             data = get_json_with_retry(url, headers=headers)
             kept_for_calendar = 0
@@ -811,37 +821,39 @@ def fetch_next_events(max_results=7):
                     }
                 )
                 kept_for_calendar += 1
-            print("Fetched:", len(data.get("items", [])), "Kept:", kept_for_calendar, "Skipped all-day:", skipped_all_day, "Skipped window:", skipped_window, "Skipped parse:", skipped_parse)
+            if EVENT_FETCH_DEBUG:
+                print("Fetched:", len(data.get("items", [])), "Kept:", kept_for_calendar, "Skipped all-day:", skipped_all_day, "Skipped window:", skipped_window, "Skipped parse:", skipped_parse)
         except Exception as e:
             print("[ERROR] Fetch failed for", calendar_id, str(e))
 
     merged_events.sort(key=lambda event: seen.get(event.get("start", {}).get("dateTime", "") + "|" + event.get("summary", ""), 0))
     # Print a short summary of the events that will be displayed
-    if merged_events:
-        print("Events displayed:")
-        for ev in merged_events[:max_results]:
-            dt = ev.get("start", {}).get("dateTime", "")
-            summary = ev.get("summary", "")
-            event_id = ev.get("id")
-            color_id = ev.get("colorId")
-            calendar_color = get_calendar_color(ev.get("_calendar_id"))
-            override_color = get_local_event_override_color(ev)
-            if len(dt) >= 16:
-                hhmm = dt[11:16]
-            else:
-                hhmm = "--:--"
-            print(
-                "{} {} id={} colorId={} localColor={} calColor=0x{:06X}".format(
-                    hhmm,
-                    summary[:24],
-                    event_id,
-                    color_id,
-                    "0x{:06X}".format(override_color) if override_color is not None else "None",
-                    calendar_color,
+    if EVENT_FETCH_DEBUG:
+        if merged_events:
+            print("Events displayed:")
+            for ev in merged_events[:max_results]:
+                dt = ev.get("start", {}).get("dateTime", "")
+                summary = ev.get("summary", "")
+                event_id = ev.get("id")
+                color_id = ev.get("colorId")
+                calendar_color = get_calendar_color(ev.get("_calendar_id"))
+                override_color = get_local_event_override_color(ev)
+                if len(dt) >= 16:
+                    hhmm = dt[11:16]
+                else:
+                    hhmm = "--:--"
+                print(
+                    "{} {} id={} colorId={} localColor={} calColor=0x{:06X}".format(
+                        hhmm,
+                        summary[:24],
+                        event_id,
+                        color_id,
+                        "0x{:06X}".format(override_color) if override_color is not None else "None",
+                        calendar_color,
+                    )
                 )
-            )
-    else:
-        print("No events displayed.")
+        else:
+            print("No events displayed.")
     return merged_events[:max_results]
 
 
@@ -972,6 +984,19 @@ def _is_pappavecka_extra_alarm_date(date_str):
     return result
 
 
+def _refresh_pappavecka_ui_active(local_epoch):
+    global pappavecka_ui_active_cached
+    pappavecka_ui_active_cached = False
+    if not (pappavecka_active and pappavecka_date):
+        return
+    try:
+        today_str = _local_epoch_to_date_str(local_epoch)
+        tomorrow_str = _local_epoch_to_date_str(local_epoch + 86400)
+        pappavecka_ui_active_cached = _is_pappavecka_extra_alarm_date(today_str) or _is_pappavecka_extra_alarm_date(tomorrow_str)
+    except Exception:
+        pappavecka_ui_active_cached = False
+
+
 MORNING_LIMIT_HOUR = 10  # Weekday first-event alarms before this hour.
 WEEKEND_MORNING_LIMIT_HOUR = 11  # Weekend first-event alarms before this hour.
 WEEKDAY_EVENT_ALARM_LEAD_MINUTES = 15
@@ -1067,12 +1092,15 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
                 tomorrow_str = _local_epoch_to_date_str(now_local_epoch + 86400)
                 for extra_date in (today_str, tomorrow_str):
                     if not _is_pappavecka_extra_alarm_date(extra_date):
-                        print("[DEBUG]     Not extra alarm date:", extra_date)
+                        if ALARM_DEBUG:
+                            print("[DEBUG]     Not extra alarm date:", extra_date)
                         continue
                     pappavecka_alarm_utc_epoch = local_date_hhmm_to_utc_epoch(extra_date, 7, 20, offset_seconds)
-                    print("[DEBUG]     Considering alarm at:", pappavecka_alarm_utc_epoch, "for date:", extra_date)
+                    if ALARM_DEBUG:
+                        print("[DEBUG]     Considering alarm at:", pappavecka_alarm_utc_epoch, "for date:", extra_date)
                     if (pappavecka_alarm_utc_epoch + 3600) > now_utc_epoch:
-                        print("[DEBUG]     Adding pappavecka 07:20 alarm for:", extra_date)
+                        if ALARM_DEBUG:
+                            print("[DEBUG]     Adding pappavecka 07:20 alarm for:", extra_date)
                         candidates.append(
                             (
                                 pappavecka_alarm_utc_epoch,
@@ -1082,10 +1110,13 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
                             )
                         )
                     else:
-                        print("[DEBUG]     Skipping alarm, already passed for:", extra_date)
-        print("candidates:", candidates)
+                        if ALARM_DEBUG:
+                            print("[DEBUG]     Skipping alarm, already passed for:", extra_date)
+        if ALARM_DEBUG:
+            print("candidates:", candidates)
         if not candidates:
-            print("[DEBUG] schedule_alarm_from_events: no alarm candidates found, returning early")
+            if ALARM_DEBUG:
+                print("[DEBUG] schedule_alarm_from_events: no alarm candidates found, returning early")
             alarm_cycle_index = 0
             return None, None, "", None
 
@@ -1093,7 +1124,8 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
         selected = None
         selected_candidates = candidates
         if now_utc_epoch is not None:
-            print("[DEBUG] schedule_alarm_from_events: filtering candidates for future alarms after:", now_utc_epoch)
+            if ALARM_DEBUG:
+                print("[DEBUG] schedule_alarm_from_events: filtering candidates for future alarms after:", now_utc_epoch)
             selected_candidates = [cand for cand in candidates if cand[0] > now_utc_epoch]
         if not selected_candidates:
             alarm_cycle_index = 0
@@ -1108,7 +1140,8 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
         local_tm = time.localtime(int(local_alarm_epoch))
         alarm_time_str = "%02d:%02d" % (local_tm.tm_hour, local_tm.tm_min)
         alarm_text = f"ALARM {alarm_time_str}"
-        print(f"[DEBUG] alarm_text set to: {alarm_text}")
+        if ALARM_DEBUG:
+            print(f"[DEBUG] alarm_text set to: {alarm_text}")
         return alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key
     except Exception as e:
         print("[EXCEPTION] schedule_alarm_from_events crashed:", repr(e))
@@ -1473,6 +1506,7 @@ max_x = max(IDLE_MIN_X, board.DISPLAY.width - startup_block_w)
 max_y = max(IDLE_MIN_Y, board.DISPLAY.height - startup_block_h)
 pappavecka_active = False
 pappavecka_date = None
+pappavecka_ui_active_cached = False
 mammavecka_active = False
 mammavecka_date = None
 weather_line1 = "Hi: --(--) Lo: --(--)"
@@ -1496,7 +1530,7 @@ def update_idle_labels(hour, minute, day, month_short):
     else:
         idle_alarm_label.text = "ALARM OFF"
     # Update pappa_button label overlays
-    if pappavecka_active:
+    if pappavecka_ui_active_cached:
         pappa_label_top.text = "PAPPA"
         pappa_label_bottom.text = "VECKA"
     else:
@@ -1629,7 +1663,7 @@ def update_events_panel(events, hour, minute, day, month_short):
         if pappa_label_bottom not in events_group:
             events_group.append(pappa_label_bottom)
         # Update overlays
-        if pappavecka_active:
+        if pappavecka_ui_active_cached:
             pappa_label_top.text = "PAPPA"
             pappa_label_bottom.text = "VECKA"
         else:
@@ -1642,12 +1676,6 @@ def update_events_panel(events, hour, minute, day, month_short):
     except Exception:
         pass
 
-    # Google Calendar event color palette (partial, add more as needed)
-    EVENT_COLORS = {
-        '1': 0xA4BDFC, '2': 0x7AE7BF, '3': 0xDBADFF, '4': 0xFF887C, '5': 0xFBD75B,
-        '6': 0xFFB878, '7': 0x46D6DB, '8': 0xE1E1E1, '9': 0x5484ED, '10': 0x51B749,
-        '11': 0xDC2127
-    }
     for i in range(EVENT_ROWS):
         if i < len(events):
             hhmm, short_summary = format_event_compact(events[i])
@@ -1814,6 +1842,12 @@ cached_idle_brightness = IDLE_BRIGHTNESS_SENSOR_FALLBACK
 last_touch_speak_at = -9999.0
 TOUCH_SPEAK_COOLDOWN_SECONDS = 2.5
 ENABLE_MAIN_LOOP_TOUCH = True
+MAIN_TOUCH_POLL_INTERVAL_SECONDS = 1.00
+last_touch_poll_at = -9999.0
+AUTO_IDLE_MAIN_CYCLE_SECONDS = 4.5
+touch_events_mode_active = False
+auto_cycle_show_events_state = False
+next_auto_cycle_switch_at = 0.0
 
 
 def set_root_group(target_group):
@@ -1847,7 +1881,9 @@ def log_crash(e):
             pass
 
 while True:
+    outer_stage = 0
     try:
+        outer_stage = 1
         now = time.monotonic()
 
         # Periodic GC helps reclaim short-lived network/UI allocations on constrained heaps.
@@ -1880,6 +1916,7 @@ while True:
 
         if (clock_base_local_epoch is None) or (now - last_time_sync > TIME_SYNC_INTERVAL):
             try:
+                outer_stage = 20
                 sync_t0 = time.monotonic()
                 mem_before_sync = gc.mem_free()
                 # Split SYNC timing for perf analysis
@@ -1916,12 +1953,14 @@ while True:
                     line4,
                     current_compact,
                 )
+                _refresh_pappavecka_ui_active(clock_base_local_epoch)
                 gc.collect()
                 # Compute current time components from synced clock_base_local_epoch
                 prepop_hour, prepop_minute, prepop_day, prepop_month_short = stockholm_components_from_epoch(clock_base_local_epoch)
-                print("populate events panel after sync")
-                update_events_panel(events, prepop_hour, prepop_minute, prepop_day, prepop_month_short)
-                log_main_screen_events(events)
+                if EVENT_FETCH_DEBUG:
+                    print("populate events panel after sync")
+                    update_events_panel(events, prepop_hour, prepop_minute, prepop_day, prepop_month_short)
+                    log_main_screen_events(events)
                 clock_base_monotonic = now
                 last_time_sync = now
                 sync_reposition_pending = True
@@ -1947,6 +1986,7 @@ while True:
                 sync_utc_epoch = clock_base_local_epoch - current_utc_offset_seconds
                 prev_key = alarm_event_key
                 if not alarm_manually_off:
+                    outer_stage = 21
                     alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
                         events, current_utc_offset_seconds, sync_utc_epoch
                     )
@@ -1964,6 +2004,7 @@ while True:
                 log_exception("sync_and_refresh", e)
 
         if (clock_base_local_epoch is not None) and (clock_base_monotonic is not None):
+            outer_stage = 30
             elapsed = int(now - clock_base_monotonic)
             current_local_epoch = clock_base_local_epoch + elapsed
             current_utc_epoch = current_local_epoch - current_utc_offset_seconds
@@ -2035,12 +2076,14 @@ while True:
 
 
         try:
+            outer_stage = 40
             # One-time warmup of events panel once we have valid time/date.
             if current_hour is not None and events_mode_until == 0:
                 prime_events_view(current_hour, current_minute, current_day, current_month_short)
                 events_mode_until = -1
 
             if current_hour is not None:
+                ui_stage = 390
                 idle_changed = (
                     (current_hour != last_idle_hour)
                     or (current_minute != last_idle_minute)
@@ -2054,6 +2097,7 @@ while True:
                     or (alarm_text != last_idle_alarm_text)
                 )
                 if idle_changed:
+                    ui_stage = 391
                     update_idle_labels(current_hour, current_minute, current_day, current_month_short)
                     last_idle_hour = current_hour
                     last_idle_minute = current_minute
@@ -2066,7 +2110,15 @@ while True:
                     last_idle_weather_line4 = weather_line4
                     last_idle_alarm_text = alarm_text
 
-            p = ts.touch_point if ENABLE_MAIN_LOOP_TOUCH else None
+            ui_stage = 400
+            p = None
+            if ENABLE_MAIN_LOOP_TOUCH:
+                # Poll touch less frequently to reduce allocator churn on constrained heaps.
+                if (now - last_touch_poll_at) >= MAIN_TOUCH_POLL_INTERVAL_SECONDS:
+                    ui_stage = 406
+                    p = ts.touch_point
+                    last_touch_poll_at = now
+            ui_stage = 401
             # Check pappa_button press first
             if p is not None and check_pappa_button_press(p):
                 # Already handled alarm cancel, do not switch screen
@@ -2074,8 +2126,11 @@ while True:
                 pass
             # Only trigger events screen if not already active
             elif p and current_hour is not None:
+                ui_stage = 402
+                touch_events_mode_active = True
                 set_display_brightness(ACTIVE_BRIGHTNESS)
                 # Update the main screen clock label before showing events screen
+                ui_stage = 403
                 update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
                 set_root_group(events_group)
                 # Switch immediately on touch; defer heavy text relayout to the events-view refresh path.
@@ -2083,19 +2138,50 @@ while True:
                 last_events_update_second = current_second
                 last_events_update_minute = None
                 # Update the main screen clock before speech
+                ui_stage = 404
                 update_idle_labels(current_hour, current_minute, current_day, current_month_short)
                 if (now - last_touch_speak_at) >= TOUCH_SPEAK_COOLDOWN_SECONDS:
+                    ui_stage = 405
                     say_time(current_hour, current_minute)
                     last_touch_speak_at = now
                 events_mode_until = now + 5  # Always extend events screen for 5 seconds after any press
 
             ui_stage = 40
+            auto_cycle_show_events = False
+            if (now >= events_mode_until) and (current_hour is not None):
+                ui_stage = 4061
+                if next_auto_cycle_switch_at <= 0.0:
+                    next_auto_cycle_switch_at = now + AUTO_IDLE_MAIN_CYCLE_SECONDS
+                if now >= next_auto_cycle_switch_at:
+                    auto_cycle_show_events_state = not auto_cycle_show_events_state
+                    next_auto_cycle_switch_at = now + AUTO_IDLE_MAIN_CYCLE_SECONDS
+                auto_cycle_show_events = auto_cycle_show_events_state
+
             if now < events_mode_until:
+                ui_stage = 410
                 set_display_brightness(ACTIVE_BRIGHTNESS)
                 set_root_group(events_group)
                 if current_hour is not None and (
                     force_events_panel_refresh or (current_minute != last_events_update_minute)
                 ):
+                    ui_stage = 411
+                    update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
+                    last_events_update_second = current_second
+                    last_events_update_minute = current_minute
+                    force_events_panel_refresh = False
+            elif auto_cycle_show_events:
+                ui_stage = 420
+                touch_events_mode_active = False
+                if (now - last_idle_brightness_update) >= 0.5:
+                    ui_stage = 421
+                    cached_idle_brightness = adaptive_idle_brightness(current_hour)
+                    last_idle_brightness_update = now
+                set_display_brightness(cached_idle_brightness)
+                set_root_group(events_group)
+                if current_hour is not None and (
+                    force_events_panel_refresh or (current_minute != last_events_update_minute)
+                ):
+                    ui_stage = 422
                     update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
                     last_events_update_second = current_second
                     last_events_update_minute = current_minute
@@ -2103,20 +2189,26 @@ while True:
             else:
                 # Before leaving events screen, voice alarm status ONCE, then return to idle
                 if active_root_group is events_group:
-                    say_alarm_status()
+                    if touch_events_mode_active:
+                        ui_stage = 431
+                        say_alarm_status()
+                    touch_events_mode_active = False
                     set_display_brightness(cached_idle_brightness)
                     set_root_group(idle_group)
                     last_events_update_second = None
                     last_events_update_minute = None
                     force_events_panel_refresh = True
                     if current_hour is None:
+                        ui_stage = 432
                         set_idle_position(x, y)
                     else:
                         if (now - last_idle_bounce_update) >= 0.10:
+                            ui_stage = 433
                             bounce_idle_labels()
                             last_idle_bounce_update = now
                 else:
                     if (now - last_idle_brightness_update) >= 0.5:
+                        ui_stage = 441
                         cached_idle_brightness = adaptive_idle_brightness(current_hour)
                         last_idle_brightness_update = now
                     set_display_brightness(cached_idle_brightness)
@@ -2125,24 +2217,35 @@ while True:
                     last_events_update_minute = None
                     force_events_panel_refresh = True
                     if current_hour is None:
+                        ui_stage = 442
                         set_idle_position(x, y)
                     else:
                         if (now - last_idle_bounce_update) >= 0.10:
+                            ui_stage = 443
                             bounce_idle_labels()
                             last_idle_bounce_update = now
         except MemoryError:
-            print("MEMERR ui_stage=%d free=%d alloc=%d" % (ui_stage, gc.mem_free(), gc.mem_alloc()))
+            # Keep memory-error logging minimal to avoid secondary allocation failures.
+            try:
+                print(ui_stage)
+            except Exception:
+                pass
             gc.collect()
             time.sleep(0.2)
             continue
+    except MemoryError:
+        # Outer safety net: keep the clock alive even if OOM happens outside inner handlers.
+        try:
+            print("OOM", outer_stage, ui_stage)
+        except Exception:
+            pass
+        gc.collect()
+        time.sleep(0.2)
+        continue
     except Exception as e:
         log_crash(e)
         microcontroller.reset()
     if PERF_LOG_ENABLED and ((now - last_perf_log) >= PERF_LOG_INTERVAL_SECONDS):
-        if loop_count_since_log <= 0:
-            loop_hz = 0
-        else:
-            loop_hz = int(loop_count_since_log / PERF_LOG_INTERVAL_SECONDS)
         # print(
         #     "PERF free=%d alloc=%d ev=%d mode=%s hz=%d dt_max_ms=%d"
         #     % (
