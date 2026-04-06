@@ -476,14 +476,14 @@ def fetch_malmo_weather_lines():
     # Malmo, Sweden coordinates
     lat = 55.6050
     lon = 13.0038
+    hourly_query = "&hourly=precipitation&forecast_hours=24" if not LIGHTWEIGHT_SYNC_MODE else ""
     url = (
         "https://api.open-meteo.com/v1/forecast"
         "?latitude=%s&longitude=%s"
         "&daily=temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,weather_code,precipitation_sum,sunrise,sunset"
         "&current=temperature_2m,apparent_temperature"
-        "&hourly=precipitation"
-        "&timezone=Europe%%2FStockholm&forecast_days=1&forecast_hours=24"
-        % (lat, lon)
+        "&timezone=Europe%%2FStockholm&forecast_days=1%s"
+        % (lat, lon, hourly_query)
     )
     try:
         data = get_json_with_retry(url)
@@ -497,9 +497,12 @@ def fetch_malmo_weather_lines():
         sunrise_list = daily.get("sunrise", [])
         sunset_list = daily.get("sunset", [])
         current = data.get("current", {})
-        hourly = data.get("hourly", {})
-        hourly_time_list = hourly.get("time", [])
-        hourly_precip_list = hourly.get("precipitation", [])
+        hourly_time_list = []
+        hourly_precip_list = []
+        if not LIGHTWEIGHT_SYNC_MODE:
+            hourly = data.get("hourly", {})
+            hourly_time_list = hourly.get("time", [])
+            hourly_precip_list = hourly.get("precipitation", [])
 
         if not hi_real_list or not lo_real_list or not hi_app_list or not lo_app_list:
             return "Hi: --(--) Lo: --(--)", "Weather", "Sun: --:-- - --:--", "", "--(--)"
@@ -615,11 +618,14 @@ PERF_GC_LOG_THRESHOLD_MS = 250
 
 # Runtime perf logging can increase allocation pressure on constrained heaps.
 # Keep lightweight PERF/SYNC enabled, but leave verbose STALL logs off.
-PERF_LOG_ENABLED = True
-PERF_SYNC_LOG_ENABLED = True
+PERF_LOG_ENABLED = False
+PERF_SYNC_LOG_ENABLED = False
 PERF_STALL_LOG_ENABLED = False
 ALARM_DEBUG = False
 EVENT_FETCH_DEBUG = False
+LIGHTWEIGHT_SYNC_MODE = True
+EVENT_FETCH_MAX_RESULTS = 5
+EVENT_FETCH_CALENDAR_MULTIPLIER = 2
 
 
 def append_diag_line(line):
@@ -711,7 +717,7 @@ def get_google_access_token():
         return None
 
 
-def fetch_next_events(max_results=7):
+def fetch_next_events(max_results=EVENT_FETCH_MAX_RESULTS):
     global pappavecka_active, pappavecka_date, mammavecka_active, mammavecka_date
     access_token = get_google_access_token()
     if not access_token:
@@ -751,7 +757,7 @@ def fetch_next_events(max_results=7):
         url = (
             get_calendar_events_api_url(calendar_id)
             + "?maxResults=%d&orderBy=startTime&singleEvents=true&timeMin=%s"
-            % (max_results * 4, time_min)
+            % (max_results * EVENT_FETCH_CALENDAR_MULTIPLIER, time_min)
         )
         if time_max:
             url += "&timeMax=%s" % time_max
@@ -1629,6 +1635,10 @@ def bounce_idle_labels():
 
 
 def update_events_panel(events, hour, minute, day, month_short):
+    was_auto_refresh = board.DISPLAY.auto_refresh
+    if was_auto_refresh:
+        board.DISPLAY.auto_refresh = False
+
     events_header.text = "Events"
     events_time_label.text = "%02d:%02d" % (hour, minute)
     events_date_label.text = "%02d %s" % (day, month_short)
@@ -1697,6 +1707,9 @@ def update_events_panel(events, hour, minute, day, month_short):
             event_time_labels[i].text = ""
             event_time_labels[i].x = EVENT_TIME_RIGHT_X
             event_title_labels[i].text = ""
+
+    if was_auto_refresh:
+        board.DISPLAY.auto_refresh = True
 
 
 
@@ -1842,12 +1855,24 @@ cached_idle_brightness = IDLE_BRIGHTNESS_SENSOR_FALLBACK
 last_touch_speak_at = -9999.0
 TOUCH_SPEAK_COOLDOWN_SECONDS = 2.5
 ENABLE_MAIN_LOOP_TOUCH = True
-MAIN_TOUCH_POLL_INTERVAL_SECONDS = 1.00
+MAIN_TOUCH_POLL_INTERVAL_SECONDS = 0.20
 last_touch_poll_at = -9999.0
 AUTO_IDLE_MAIN_CYCLE_SECONDS = 4.5
 touch_events_mode_active = False
+speak_alarm_on_events_exit_pending = False
 auto_cycle_show_events_state = False
 next_auto_cycle_switch_at = 0.0
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+last_heartbeat_at = 0.0
+consecutive_oom_count = 0
+OOM_RESET_THRESHOLD = 0
+skip_stage30_until = 0.0
+STAGE30_UPDATE_INTERVAL_SECONDS = 1.0
+next_stage30_update_at = 0.0
+LOW_MEM_UI_GUARD_BYTES = 20000
+skip_idle_compare_until = 0.0
+touch_read_disable_until = 0.0
+sync_retry_after_oom_until = 0.0
 
 
 def set_root_group(target_group):
@@ -1882,6 +1907,7 @@ def log_crash(e):
 
 while True:
     outer_stage = 0
+    ui_stage = -1
     try:
         outer_stage = 1
         now = time.monotonic()
@@ -1914,7 +1940,7 @@ while True:
             last_loop_now = now
             loop_count_since_log += 1
 
-        if (clock_base_local_epoch is None) or (now - last_time_sync > TIME_SYNC_INTERVAL):
+        if ((clock_base_local_epoch is None) or (now - last_time_sync > TIME_SYNC_INTERVAL)) and (now >= sync_retry_after_oom_until):
             try:
                 outer_stage = 20
                 sync_t0 = time.monotonic()
@@ -1957,6 +1983,25 @@ while True:
                 gc.collect()
                 # Compute current time components from synced clock_base_local_epoch
                 prepop_hour, prepop_minute, prepop_day, prepop_month_short = stockholm_components_from_epoch(clock_base_local_epoch)
+                current_hour = prepop_hour
+                current_minute = prepop_minute
+                current_day = prepop_day
+                current_month_short = prepop_month_short
+                current_second = clock_base_local_epoch % 60
+                try:
+                    update_idle_labels(prepop_hour, prepop_minute, prepop_day, prepop_month_short)
+                    last_idle_hour = prepop_hour
+                    last_idle_minute = prepop_minute
+                    last_idle_day = prepop_day
+                    last_idle_month_short = prepop_month_short
+                    last_idle_weather_current = weather_current
+                    last_idle_weather_line1 = weather_line1
+                    last_idle_weather_line2 = weather_line2
+                    last_idle_weather_line3 = weather_line3
+                    last_idle_weather_line4 = weather_line4
+                    last_idle_alarm_text = alarm_text
+                except MemoryError:
+                    gc.collect()
                 if EVENT_FETCH_DEBUG:
                     print("populate events panel after sync")
                     update_events_panel(events, prepop_hour, prepop_minute, prepop_day, prepop_month_short)
@@ -2003,20 +2048,31 @@ while True:
             except Exception as e:
                 log_exception("sync_and_refresh", e)
 
-        if (clock_base_local_epoch is not None) and (clock_base_monotonic is not None):
+        if (
+            (clock_base_local_epoch is not None)
+            and (clock_base_monotonic is not None)
+            and (now >= skip_stage30_until)
+            and (now >= next_stage30_update_at)
+        ):
+            next_stage30_update_at = now + STAGE30_UPDATE_INTERVAL_SECONDS
             outer_stage = 30
+            outer_stage = 301
             elapsed = int(now - clock_base_monotonic)
             current_local_epoch = clock_base_local_epoch + elapsed
             current_utc_epoch = current_local_epoch - current_utc_offset_seconds
+            outer_stage = 302
             current_hour, current_minute, current_day, current_month_short = stockholm_components_from_epoch(current_local_epoch)
             current_second = current_local_epoch % 60
 
+            outer_stage = 303
             if sync_reposition_pending:
-                x = random.randint(IDLE_MIN_X, max_x) if max_x > IDLE_MIN_X else IDLE_MIN_X
-                y = random.randint(IDLE_MIN_Y, max_y) if max_y > IDLE_MIN_Y else IDLE_MIN_Y
+                # Keep reposition deterministic to avoid random-state allocations on low heap.
+                x = IDLE_MIN_X if IDLE_MIN_X <= max_x else max_x
+                y = IDLE_MIN_Y if IDLE_MIN_Y <= max_y else max_y
                 sync_reposition_pending = False
 
             # Trigger alarm once when entering alarm window for first event.
+            outer_stage = 304
             if (
                 alarm_utc_epoch is not None
                 and alarm_event_utc_epoch is not None
@@ -2025,16 +2081,22 @@ while True:
                 and alarm_event_key is not None
                 and alarm_fired_for_key != alarm_event_key
             ):
-                set_display_brightness(ACTIVE_BRIGHTNESS)
-                set_root_group(events_group)
-                update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
-                last_events_update_second = current_second
-                last_events_update_minute = current_minute
-                force_events_panel_refresh = False
-                run_alarm_until_touch()
-                alarm_fired_for_key = alarm_event_key
+                try:
+                    set_display_brightness(ACTIVE_BRIGHTNESS)
+                    set_root_group(events_group)
+                    update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
+                    last_events_update_second = current_second
+                    last_events_update_minute = current_minute
+                    force_events_panel_refresh = False
+                    run_alarm_until_touch()
+                    alarm_fired_for_key = alarm_event_key
+                except MemoryError:
+                    # If alarm playback cannot allocate, mark handled for this key to avoid OOM retry loops.
+                    alarm_fired_for_key = alarm_event_key
+                    gc.collect()
 
             # Keep schedule state fresh between syncs so expired alarms disappear immediately.
+            outer_stage = 305
             events_pruned = False
             while events:
                 first_start_dt = events[0].get("start", {}).get("dateTime", "")
@@ -2045,15 +2107,17 @@ while True:
                 except Exception:
                     break
                 if first_event_utc_epoch <= current_utc_epoch:
-                    events = events[1:]
+                    events.pop(0)
                     events_pruned = True
                 else:
                     break
 
+            outer_stage = 306
             alarm_window_expired = (
                 alarm_event_utc_epoch is not None and current_utc_epoch >= alarm_event_utc_epoch
             )
             if events_pruned or alarm_window_expired:
+                outer_stage = 307
                 prev_key = alarm_event_key
                 alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
                     events, current_utc_offset_seconds, current_utc_epoch
@@ -2077,47 +2141,101 @@ while True:
 
         try:
             outer_stage = 40
+            ui_stage = 380
+            ui_stage = 3801
             # One-time warmup of events panel once we have valid time/date.
             if current_hour is not None and events_mode_until == 0:
+                ui_stage = 38011
                 prime_events_view(current_hour, current_minute, current_day, current_month_short)
                 events_mode_until = -1
 
-            if current_hour is not None:
-                ui_stage = 390
-                idle_changed = (
-                    (current_hour != last_idle_hour)
-                    or (current_minute != last_idle_minute)
-                    or (current_day != last_idle_day)
-                    or (current_month_short != last_idle_month_short)
-                    or (weather_current != last_idle_weather_current)
-                    or (weather_line1 != last_idle_weather_line1)
-                    or (weather_line2 != last_idle_weather_line2)
-                    or (weather_line3 != last_idle_weather_line3)
-                    or (weather_line4 != last_idle_weather_line4)
-                    or (alarm_text != last_idle_alarm_text)
-                )
-                if idle_changed:
-                    ui_stage = 391
-                    update_idle_labels(current_hour, current_minute, current_day, current_month_short)
-                    last_idle_hour = current_hour
-                    last_idle_minute = current_minute
-                    last_idle_day = current_day
-                    last_idle_month_short = current_month_short
-                    last_idle_weather_current = weather_current
-                    last_idle_weather_line1 = weather_line1
-                    last_idle_weather_line2 = weather_line2
-                    last_idle_weather_line3 = weather_line3
-                    last_idle_weather_line4 = weather_line4
-                    last_idle_alarm_text = alarm_text
+            ui_stage = 3802
+            if now < skip_idle_compare_until:
+                ui_stage = 38020
+                force_events_panel_refresh = False
+                touch_events_mode_active = False
+                speak_alarm_on_events_exit_pending = False
+                try:
+                    set_display_brightness(cached_idle_brightness)
+                    set_root_group(idle_group)
+                except MemoryError:
+                    gc.collect()
+                time.sleep(0.05)
+                continue
 
-            ui_stage = 400
+            if current_hour is not None:
+                ui_stage = 38021
+                if now < skip_idle_compare_until:
+                    ui_stage = 38022
+                    ui_stage = 3890
+                else:
+                    ui_stage = 38023
+                    ui_stage = 389
+                    low_mem_ui = False
+                    try:
+                        low_mem_ui = gc.mem_free() < LOW_MEM_UI_GUARD_BYTES
+                    except MemoryError:
+                        low_mem_ui = True
+                        gc.collect()
+                    if low_mem_ui:
+                        ui_stage = 38024
+                        force_events_panel_refresh = False
+                    else:
+                        ui_stage = 390
+                        ui_stage = 3901
+                        idle_changed = (
+                            (current_hour != last_idle_hour)
+                            or (current_minute != last_idle_minute)
+                            or (current_day != last_idle_day)
+                            or (current_month_short != last_idle_month_short)
+                            or (weather_current != last_idle_weather_current)
+                            or (weather_line1 != last_idle_weather_line1)
+                            or (weather_line2 != last_idle_weather_line2)
+                            or (weather_line3 != last_idle_weather_line3)
+                            or (weather_line4 != last_idle_weather_line4)
+                            or (alarm_text != last_idle_alarm_text)
+                        )
+                        ui_stage = 3902
+                        if idle_changed:
+                            ui_stage = 391
+                            update_idle_labels(current_hour, current_minute, current_day, current_month_short)
+                            last_idle_hour = current_hour
+                            last_idle_minute = current_minute
+                            last_idle_day = current_day
+                            last_idle_month_short = current_month_short
+                            last_idle_weather_current = weather_current
+                            last_idle_weather_line1 = weather_line1
+                            last_idle_weather_line2 = weather_line2
+                            last_idle_weather_line3 = weather_line3
+                            last_idle_weather_line4 = weather_line4
+                            last_idle_alarm_text = alarm_text
+
             p = None
-            if ENABLE_MAIN_LOOP_TOUCH:
-                # Poll touch less frequently to reduce allocator churn on constrained heaps.
-                if (now - last_touch_poll_at) >= MAIN_TOUCH_POLL_INTERVAL_SECONDS:
-                    ui_stage = 406
-                    p = ts.touch_point
-                    last_touch_poll_at = now
+            try:
+                ui_stage = 3803
+                p = None
+                ui_stage = 38031
+                ui_stage = 400
+                ui_stage = 38032
+                if ENABLE_MAIN_LOOP_TOUCH:
+                    ui_stage = 38033
+                    # Poll touch less frequently and guard read failures under low-memory pressure.
+                    if now >= touch_read_disable_until:
+                        if (now - last_touch_poll_at) >= MAIN_TOUCH_POLL_INTERVAL_SECONDS:
+                            ui_stage = 406
+                            try:
+                                p = ts.touch_point
+                                last_touch_poll_at = now
+                            except MemoryError:
+                                ui_stage = 407
+                                touch_read_disable_until = now + 10.0
+                                gc.collect()
+                                p = None
+            except MemoryError:
+                ui_stage = 38039
+                touch_read_disable_until = now + 10.0
+                gc.collect()
+                p = None
             ui_stage = 401
             # Check pappa_button press first
             if p is not None and check_pappa_button_press(p):
@@ -2128,22 +2246,23 @@ while True:
             elif p and current_hour is not None:
                 ui_stage = 402
                 touch_events_mode_active = True
+                speak_alarm_on_events_exit_pending = True
+                if (now - last_touch_speak_at) >= TOUCH_SPEAK_COOLDOWN_SECONDS:
+                    ui_stage = 4021
+                    last_touch_speak_at = now
+                    try:
+                        say_time(current_hour, current_minute)
+                    except MemoryError:
+                        gc.collect()
+                    except Exception:
+                        pass
                 set_display_brightness(ACTIVE_BRIGHTNESS)
-                # Update the main screen clock label before showing events screen
+                # Keep immediate touch path lightweight to stay responsive on low heap.
                 ui_stage = 403
-                update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
                 set_root_group(events_group)
-                # Switch immediately on touch; defer heavy text relayout to the events-view refresh path.
                 force_events_panel_refresh = True
                 last_events_update_second = current_second
                 last_events_update_minute = None
-                # Update the main screen clock before speech
-                ui_stage = 404
-                update_idle_labels(current_hour, current_minute, current_day, current_month_short)
-                if (now - last_touch_speak_at) >= TOUCH_SPEAK_COOLDOWN_SECONDS:
-                    ui_stage = 405
-                    say_time(current_hour, current_minute)
-                    last_touch_speak_at = now
                 events_mode_until = now + 5  # Always extend events screen for 5 seconds after any press
 
             ui_stage = 40
@@ -2189,9 +2308,15 @@ while True:
             else:
                 # Before leaving events screen, voice alarm status ONCE, then return to idle
                 if active_root_group is events_group:
-                    if touch_events_mode_active:
+                    if speak_alarm_on_events_exit_pending:
                         ui_stage = 431
-                        say_alarm_status()
+                        try:
+                            say_alarm_status()
+                        except MemoryError:
+                            gc.collect()
+                        except Exception:
+                            pass
+                        speak_alarm_on_events_exit_pending = False
                     touch_events_mode_active = False
                     set_display_brightness(cached_idle_brightness)
                     set_root_group(idle_group)
@@ -2226,8 +2351,11 @@ while True:
                             last_idle_bounce_update = now
         except MemoryError:
             # Keep memory-error logging minimal to avoid secondary allocation failures.
+            if ui_stage in (3802, 38021, 38022, 38023, 390, 3901):
+                skip_idle_compare_until = now + 30.0
+                force_events_panel_refresh = False
             try:
-                print(ui_stage)
+                print("UI_MEM", outer_stage, ui_stage)
             except Exception:
                 pass
             gc.collect()
@@ -2235,12 +2363,34 @@ while True:
             continue
     except MemoryError:
         # Outer safety net: keep the clock alive even if OOM happens outside inner handlers.
+        consecutive_oom_count += 1
         try:
             print("OOM", outer_stage, ui_stage)
         except Exception:
             pass
+        if outer_stage == 301:
+            # Stage-301 OOM means local time advance failed; bypass stage-30 work briefly.
+            skip_stage30_until = now + 20.0
+        if outer_stage == 20:
+            # Stage-20 OOM means sync path cannot allocate right now; back off and keep clock alive.
+            sync_retry_after_oom_until = now + 45.0
+            skip_idle_compare_until = now + 60.0
+            touch_read_disable_until = now + 60.0
+            events_mode_until = -1
+            force_events_panel_refresh = False
+            if (clock_base_local_epoch is None) or (clock_base_monotonic is None):
+                try:
+                    fallback_local_epoch = int(time.mktime(time.localtime()))
+                    clock_base_local_epoch = fallback_local_epoch
+                    clock_base_monotonic = now
+                    last_time_sync = now
+                except Exception:
+                    pass
+        if OOM_RESET_THRESHOLD > 0 and consecutive_oom_count >= OOM_RESET_THRESHOLD:
+            microcontroller.reset()
         gc.collect()
-        time.sleep(0.2)
+        gc.collect()
+        time.sleep(1.0)
         continue
     except Exception as e:
         log_crash(e)
@@ -2263,3 +2413,15 @@ while True:
 
     time.sleep(0.05)
 
+    # Lightweight liveness pulse so serial output shows the loop is still running.
+    if (now - last_heartbeat_at) >= HEARTBEAT_INTERVAL_SECONDS:
+        try:
+            print("HB", gc.mem_free(), "E" if active_root_group is events_group else "I")
+        except Exception:
+            pass
+        last_heartbeat_at = now
+
+    # Successful loop iteration clears OOM streak.
+    consecutive_oom_count = 0
+
+    time.sleep(0.05)
