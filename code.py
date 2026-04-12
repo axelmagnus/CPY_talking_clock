@@ -359,17 +359,23 @@ def get_json_with_retry(url, headers=None, retries=3):
     global requests
     last_error = None
     for attempt in range(retries):
+        resp = None
         try:
             ensure_wifi_connected()
             resp = requests.get(url, headers=headers)
             data = resp.json()
-            resp.close()
             return data
         except Exception as e:
             last_error = e
             # Recreate session to recover from socket/SSL parser glitches.
             requests = adafruit_requests.Session(pool, ssl_context)
             time.sleep(1)
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
     raise last_error
 
 
@@ -561,13 +567,33 @@ def fetch_malmo_weather_lines():
         return "Hi: --(--) Lo: --(--)", "Weather", "Sun: --:-- - --:--", "", "--(--)"
 
 
+def weather_fetch_failed(line1, line2, line3, current_compact):
+    return (
+        line1 == "Hi: --(--) Lo: --(--)"
+        and line2 == "Weather"
+        and line3 == "Sun: --:-- - --:--"
+        and current_compact == "--(--)"
+    )
+
+
 CACHED_NOW_ISO = fetch_current_time_iso()
 
 
 # --- Google Calendar ---
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
+def getenv_stripped(name):
+    value = os.getenv(name)
+    if value is None:
+        return None
+    return value.strip()
+
+
+GOOGLE_CLIENT_ID = getenv_stripped("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = getenv_stripped("GOOGLE_CLIENT_SECRET")
+GOOGLE_REFRESH_TOKEN = getenv_stripped("GOOGLE_REFRESH_TOKEN")
+GOOGLE_ACCESS_TOKEN_CACHE = None
+GOOGLE_ACCESS_TOKEN_EXPIRES_AT = 0.0
+GOOGLE_TOKEN_REFRESH_SAFETY_SECONDS = 120
+GOOGLE_TOKEN_STALE_GRACE_SECONDS = 300
 GOOGLE_CALENDAR_IDS = [
     "axel.mansson@skola.malmo.se",
     "axel.magnus.mansson@gmail.com",
@@ -624,8 +650,8 @@ PERF_STALL_LOG_ENABLED = False
 ALARM_DEBUG = False
 EVENT_FETCH_DEBUG = False
 LIGHTWEIGHT_SYNC_MODE = True
-EVENT_FETCH_MAX_RESULTS = 5
-EVENT_FETCH_CALENDAR_MULTIPLIER = 2
+EVENT_FETCH_MAX_RESULTS = 7
+EVENT_FETCH_CALENDAR_MULTIPLIER = 1
 
 
 def append_diag_line(line):
@@ -697,28 +723,89 @@ def epoch_to_utc_iso(epoch_seconds):
     )
 
 
+def _urlencode_form_component(value):
+    if value is None:
+        return ""
+    s = str(value)
+    out = ""
+    for ch in s:
+        code = ord(ch)
+        if (
+            (48 <= code <= 57)
+            or (65 <= code <= 90)
+            or (97 <= code <= 122)
+            or ch in "-_.~"
+        ):
+            out += ch
+        else:
+            out += "%{:02X}".format(code)
+    return out
+
+
 def get_google_access_token():
+    global GOOGLE_ACCESS_TOKEN_CACHE, GOOGLE_ACCESS_TOKEN_EXPIRES_AT
+    now_mono = time.monotonic()
+    if GOOGLE_ACCESS_TOKEN_CACHE and now_mono < GOOGLE_ACCESS_TOKEN_EXPIRES_AT:
+        return GOOGLE_ACCESS_TOKEN_CACHE
+
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not GOOGLE_REFRESH_TOKEN:
+        print("Google auth config missing in settings.toml")
+        return None
+
     url = "https://oauth2.googleapis.com/token"
     data = (
         "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token".format(
-            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
+            _urlencode_form_component(GOOGLE_CLIENT_ID),
+            _urlencode_form_component(GOOGLE_CLIENT_SECRET),
+            _urlencode_form_component(GOOGLE_REFRESH_TOKEN),
         )
     )
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    resp = None
     try:
         resp = post_form_with_retry(url, data=data, headers=headers)
         if resp.status_code == 200:
             token_data = resp.json()
-            resp.close()
-            return token_data.get("access_token")
-        resp.close()
+            access_token = token_data.get("access_token")
+            expires_in = int(token_data.get("expires_in", 3600))
+            if access_token:
+                GOOGLE_ACCESS_TOKEN_CACHE = access_token
+                GOOGLE_ACCESS_TOKEN_EXPIRES_AT = now_mono + max(
+                    60, expires_in - GOOGLE_TOKEN_REFRESH_SAFETY_SECONDS
+                )
+                return access_token
+            print("Google token refresh returned no access_token")
+            return None
+        error_name = ""
+        try:
+            err = resp.json()
+            error_name = err.get("error", "")
+        except Exception:
+            error_name = ""
+        if error_name:
+            print("Google token refresh failed status", resp.status_code, error_name)
+        else:
+            print("Google token refresh failed status", resp.status_code)
         return None
-    except Exception:
+    except Exception as e:
+        print("Google token refresh exception", repr(e))
+        if (
+            GOOGLE_ACCESS_TOKEN_CACHE
+            and now_mono < (GOOGLE_ACCESS_TOKEN_EXPIRES_AT + GOOGLE_TOKEN_STALE_GRACE_SECONDS)
+        ):
+            print("Using stale cached Google access token")
+            return GOOGLE_ACCESS_TOKEN_CACHE
         return None
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
 
 def fetch_next_events(max_results=EVENT_FETCH_MAX_RESULTS):
-    global pappavecka_active, pappavecka_date, mammavecka_active, mammavecka_date
+    global pappavecka_active, pappavecka_date, mammavecka_active, mammavecka_date, events
     access_token = get_google_access_token()
     if not access_token:
         print("No access token, aborting fetch_next_events")
@@ -730,8 +817,8 @@ def fetch_next_events(max_results=EVENT_FETCH_MAX_RESULTS):
         offset_seconds = _parse_utc_offset_seconds(data.get("utc_offset", "+00:00"))
         now_local_epoch = now_epoch + offset_seconds
         now_local_tm = time.localtime(now_local_epoch)
-        # On weekends, look further ahead so Monday events are still listed.
-        lookahead_hours = 72 if now_local_tm.tm_wday >= 5 else 24
+        # Keep event window strictly within the next 24 hours.
+        lookahead_hours = 24
         max_local_epoch = now_local_epoch + lookahead_hours * 60 * 60
         # Use local time window for event inclusion
         time_min = epoch_to_utc_iso(now_local_epoch - offset_seconds)
@@ -748,17 +835,21 @@ def fetch_next_events(max_results=EVENT_FETCH_MAX_RESULTS):
     headers = {"Authorization": "Bearer %s" % access_token}
     merged_events = []
     seen = {}
+    failed_calendar_ids = {}
     pappavecka_active = False
     pappavecka_date = None
     mammavecka_active = False
     mammavecka_date = None
 
     for calendar_id in GOOGLE_CALENDAR_IDS:
+        gc.collect()
         url = (
             get_calendar_events_api_url(calendar_id)
             + "?maxResults=%d&orderBy=startTime&singleEvents=true&timeMin=%s"
             % (max_results * EVENT_FETCH_CALENDAR_MULTIPLIER, time_min)
         )
+        # Keep response small to reduce JSON parse allocations on constrained heaps.
+        url += "&fields=items(id,summary,start,colorId)"
         if time_max:
             url += "&timeMax=%s" % time_max
 
@@ -813,7 +904,8 @@ def fetch_next_events(max_results=EVENT_FETCH_MAX_RESULTS):
                         skipped_window += 1
                         continue
 
-                event_key = start_dt + "|" + event.get("summary", "")
+                # Include calendar id so same-time/title events from different calendars are kept.
+                event_key = calendar_id + "|" + start_dt + "|" + event.get("summary", "")
                 if event_key in seen:
                     continue
                 seen[event_key] = event_epoch
@@ -823,6 +915,7 @@ def fetch_next_events(max_results=EVENT_FETCH_MAX_RESULTS):
                         "start": {"dateTime": start_dt},
                         "summary": summary if summary else "(No title)",
                         "_calendar_id": calendar_id,
+                        "_start_epoch": event_epoch,
                         "colorId": event.get("colorId") if "colorId" in event else None,
                     }
                 )
@@ -831,8 +924,55 @@ def fetch_next_events(max_results=EVENT_FETCH_MAX_RESULTS):
                 print("Fetched:", len(data.get("items", [])), "Kept:", kept_for_calendar, "Skipped all-day:", skipped_all_day, "Skipped window:", skipped_window, "Skipped parse:", skipped_parse)
         except Exception as e:
             print("[ERROR] Fetch failed for", calendar_id, str(e))
+            failed_calendar_ids[calendar_id] = True
+        finally:
+            data = None
+            gc.collect()
 
-    merged_events.sort(key=lambda event: seen.get(event.get("start", {}).get("dateTime", "") + "|" + event.get("summary", ""), 0))
+    # If a calendar fails during refresh, keep its previous entries so it doesn't disappear.
+    if failed_calendar_ids and events:
+        for old_event in events:
+            old_calendar_id = old_event.get("_calendar_id")
+            if old_calendar_id not in failed_calendar_ids:
+                continue
+
+            old_start_dt = old_event.get("start", {}).get("dateTime", "")
+            if not old_start_dt:
+                continue
+
+            if now_local_epoch is not None and max_local_epoch is not None:
+                try:
+                    old_event_utc_epoch = rfc3339_to_epoch(old_start_dt)
+                    old_event_local_epoch = old_event_utc_epoch + offset_seconds
+                    if old_event_local_epoch < now_local_epoch or old_event_local_epoch > max_local_epoch:
+                        continue
+                except Exception:
+                    continue
+            else:
+                try:
+                    old_event_utc_epoch = rfc3339_to_epoch(old_start_dt)
+                except Exception:
+                    continue
+
+            old_event_key = old_calendar_id + "|" + old_start_dt + "|" + old_event.get("summary", "")
+            if old_event_key in seen:
+                continue
+            seen[old_event_key] = old_event_utc_epoch
+            old_event["_start_epoch"] = old_event_utc_epoch
+            merged_events.append(old_event)
+
+    # Ensure all events have epoch metadata and final ordering is strictly chronological.
+    for ev in merged_events:
+        if "_start_epoch" not in ev:
+            dt = ev.get("start", {}).get("dateTime", "")
+            if dt:
+                try:
+                    ev["_start_epoch"] = rfc3339_to_epoch(dt)
+                except Exception:
+                    ev["_start_epoch"] = 0
+            else:
+                ev["_start_epoch"] = 0
+    merged_events.sort(key=lambda event: event.get("_start_epoch", 0))
     # Print a short summary of the events that will be displayed
     if EVENT_FETCH_DEBUG:
         if merged_events:
@@ -980,7 +1120,6 @@ def _is_pappavecka_extra_alarm_date(date_str):
         return False
     # Dad-week extra wake alarm is Tue-Fri only.
     extra_dates = (
-        _add_days_local_date(pappavecka_date, 0),  # include pappavecka_date itself
         _add_days_local_date(pappavecka_date, 1),
         _add_days_local_date(pappavecka_date, 2),
         _add_days_local_date(pappavecka_date, 3),
@@ -1818,8 +1957,10 @@ def adaptive_idle_brightness(hour):
 # --- Main loop ---
 TIME_SYNC_INTERVAL = 15 * 60  # 15 min: keep events/alarms fresh during the day.
 CALENDAR_SYNC_INTERVAL = 15 * 60
+WEATHER_RETRY_INTERVAL_SECONDS = 30
 last_time_sync = 0
 last_calendar_sync = 0
+weather_retry_due_at = 0.0
 clock_base_monotonic = None
 clock_base_local_epoch = None
 current_hour = None
@@ -1854,10 +1995,13 @@ last_idle_brightness_update = 0.0
 cached_idle_brightness = IDLE_BRIGHTNESS_SENSOR_FALLBACK
 last_touch_speak_at = -9999.0
 TOUCH_SPEAK_COOLDOWN_SECONDS = 2.5
+ALARM_AFTER_TIME_DELAY_SECONDS = 1.0
+PRESS_EVENTS_HOLD_SECONDS = 5.0
 ENABLE_MAIN_LOOP_TOUCH = True
 MAIN_TOUCH_POLL_INTERVAL_SECONDS = 0.20
 last_touch_poll_at = -9999.0
 AUTO_IDLE_MAIN_CYCLE_SECONDS = 4.5
+ENABLE_IDLE_BOUNCE = False
 touch_events_mode_active = False
 speak_alarm_on_events_exit_pending = False
 auto_cycle_show_events_state = False
@@ -1940,7 +2084,9 @@ while True:
             last_loop_now = now
             loop_count_since_log += 1
 
-        if ((clock_base_local_epoch is None) or (now - last_time_sync > TIME_SYNC_INTERVAL)) and (now >= sync_retry_after_oom_until):
+        needs_periodic_sync = (clock_base_local_epoch is None) or (now - last_time_sync > TIME_SYNC_INTERVAL)
+        needs_weather_retry = (weather_retry_due_at > 0.0) and (now >= weather_retry_due_at)
+        if (needs_periodic_sync or needs_weather_retry) and (now >= sync_retry_after_oom_until):
             try:
                 outer_stage = 20
                 sync_t0 = time.monotonic()
@@ -2008,6 +2154,20 @@ while True:
                     log_main_screen_events(events)
                 clock_base_monotonic = now
                 last_time_sync = now
+                weather_failed = weather_fetch_failed(line1, line2, line3, current_compact)
+                if weather_failed:
+                    weather_retry_due_at = now + WEATHER_RETRY_INTERVAL_SECONDS
+                    try:
+                        print("WEATHER_FAIL retry_in", WEATHER_RETRY_INTERVAL_SECONDS)
+                    except Exception:
+                        pass
+                else:
+                    if weather_retry_due_at > 0.0:
+                        try:
+                            print("WEATHER_OK")
+                        except Exception:
+                            pass
+                    weather_retry_due_at = 0.0
                 sync_reposition_pending = True
                 force_events_panel_refresh = True
                 if PERF_SYNC_LOG_ENABLED:
@@ -2116,7 +2276,13 @@ while True:
             alarm_window_expired = (
                 alarm_event_utc_epoch is not None and current_utc_epoch >= alarm_event_utc_epoch
             )
-            if events_pruned or alarm_window_expired:
+            alarm_time_passed_after_stop = (
+                alarm_utc_epoch is not None
+                and current_utc_epoch >= alarm_utc_epoch
+                and alarm_event_key is not None
+                and alarm_fired_for_key == alarm_event_key
+            )
+            if events_pruned or alarm_window_expired or alarm_time_passed_after_stop:
                 outer_stage = 307
                 prev_key = alarm_event_key
                 alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
@@ -2237,33 +2403,42 @@ while True:
                 gc.collect()
                 p = None
             ui_stage = 401
+            if p is not None:
+                set_display_brightness(ACTIVE_BRIGHTNESS)
             # Check pappa_button press first
             if p is not None and check_pappa_button_press(p):
                 # Already handled alarm cancel, do not switch screen
                 beep_ok()
-                pass
+                touch_events_mode_active = True
+                set_display_brightness(ACTIVE_BRIGHTNESS)
+                set_root_group(events_group)
+                events_mode_until = now + PRESS_EVENTS_HOLD_SECONDS
             # Only trigger events screen if not already active
             elif p and current_hour is not None:
                 ui_stage = 402
                 touch_events_mode_active = True
-                speak_alarm_on_events_exit_pending = True
-                if (now - last_touch_speak_at) >= TOUCH_SPEAK_COOLDOWN_SECONDS:
-                    ui_stage = 4021
-                    last_touch_speak_at = now
-                    try:
-                        say_time(current_hour, current_minute)
-                    except MemoryError:
-                        gc.collect()
-                    except Exception:
-                        pass
+                speak_alarm_on_events_exit_pending = False
                 set_display_brightness(ACTIVE_BRIGHTNESS)
                 # Keep immediate touch path lightweight to stay responsive on low heap.
                 ui_stage = 403
                 set_root_group(events_group)
                 force_events_panel_refresh = True
+                update_events_panel(events, current_hour, current_minute, current_day, current_month_short)
                 last_events_update_second = current_second
-                last_events_update_minute = None
-                events_mode_until = now + 5  # Always extend events screen for 5 seconds after any press
+                last_events_update_minute = current_minute
+                force_events_panel_refresh = False
+                events_mode_until = now + PRESS_EVENTS_HOLD_SECONDS
+                if (now - last_touch_speak_at) >= TOUCH_SPEAK_COOLDOWN_SECONDS:
+                    ui_stage = 4021
+                    last_touch_speak_at = now
+                    try:
+                        say_time(current_hour, current_minute)
+                        time.sleep(ALARM_AFTER_TIME_DELAY_SECONDS)
+                        say_alarm_status()
+                    except MemoryError:
+                        gc.collect()
+                    except Exception:
+                        pass
 
             ui_stage = 40
             auto_cycle_show_events = False
@@ -2327,7 +2502,7 @@ while True:
                         ui_stage = 432
                         set_idle_position(x, y)
                     else:
-                        if (now - last_idle_bounce_update) >= 0.10:
+                        if ENABLE_IDLE_BOUNCE and (now - last_idle_bounce_update) >= 0.10:
                             ui_stage = 433
                             bounce_idle_labels()
                             last_idle_bounce_update = now
@@ -2345,7 +2520,7 @@ while True:
                         ui_stage = 442
                         set_idle_position(x, y)
                     else:
-                        if (now - last_idle_bounce_update) >= 0.10:
+                        if ENABLE_IDLE_BOUNCE and (now - last_idle_bounce_update) >= 0.10:
                             ui_stage = 443
                             bounce_idle_labels()
                             last_idle_bounce_update = now
@@ -2378,6 +2553,7 @@ while True:
             touch_read_disable_until = now + 60.0
             events_mode_until = -1
             force_events_panel_refresh = False
+            weather_retry_due_at = now + WEATHER_RETRY_INTERVAL_SECONDS
             if (clock_base_local_epoch is None) or (clock_base_monotonic is None):
                 try:
                     fallback_local_epoch = int(time.mktime(time.localtime()))
