@@ -106,7 +106,7 @@ def schedule_alarm_from_events(events, offset_seconds, now_utc_epoch=None):
 last_canceled_alarm_event_key = None
 
 def cancel_next_alarm_and_reschedule():
-    global alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key, alarm_fired_for_key, events, last_canceled_alarm_event_key, alarm_cycle_index
+    global alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key, alarm_fired_for_key, events, last_canceled_alarm_event_key, alarm_cycle_index, alarm_manually_off_until_epoch
     # Remove the first alarm candidate and reschedule
     # Use the same logic as schedule_alarm_from_events, but skip the first candidate
     offset_seconds = current_utc_offset_seconds
@@ -192,6 +192,8 @@ def cancel_next_alarm_and_reschedule():
         alarm_cycle_index = (alarm_cycle_index + 1) % (num_alarms + 1)
         global alarm_manually_off
         if num_alarms == 0 or alarm_cycle_index == num_alarms:
+            # Save the latest candidate's event epoch so we know when to auto-re-enable alarms.
+            alarm_manually_off_until_epoch = candidates[-1][1] if candidates else (now_utc_epoch + 3600 if now_utc_epoch else None)
             alarm_utc_epoch = None
             alarm_event_utc_epoch = None
             alarm_text = ""
@@ -331,8 +333,29 @@ esp32_reset = DigitalInOut(board.ESP_RESET)
 spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
 esp = adafruit_esp32spi.ESP_SPIcontrol(spi, esp32_cs, esp32_ready, esp32_reset)
 
-ssid = os.getenv("CIRCUITPY_WIFI_SSID")
-password = os.getenv("CIRCUITPY_WIFI_PASSWORD")
+# Build list of known networks from settings.toml
+_known_networks = []
+for _i in ("1", "2", "3"):
+    _s = os.getenv("WIFI_SSID_" + _i)
+    _p = os.getenv("WIFI_PASSWORD_" + _i)
+    if _s and _p:
+        _known_networks.append((_s, _p))
+
+# Scan and pick the first visible known network.
+ssid = None
+password = None
+try:
+    _scan = esp.scan_networks()
+    _visible = set(n["ssid"] for n in _scan if n.get("ssid"))
+    for _s, _p in _known_networks:
+        if _s in _visible:
+            ssid, password = _s, _p
+            break
+except Exception:
+    pass
+if ssid is None and _known_networks:
+    ssid, password = _known_networks[0]  # fallback: try first network
+print("Connecting to WiFi:", ssid)
 
 pool = adafruit_connection_manager.get_radio_socketpool(esp)
 ssl_context = adafruit_connection_manager.get_radio_ssl_context(esp)
@@ -843,10 +866,11 @@ def fetch_next_events(max_results=EVENT_FETCH_MAX_RESULTS):
 
     for calendar_id in GOOGLE_CALENDAR_IDS:
         gc.collect()
+        requested_max_results = max(max_results * EVENT_FETCH_CALENDAR_MULTIPLIER, 14)
         url = (
             get_calendar_events_api_url(calendar_id)
             + "?maxResults=%d&orderBy=startTime&singleEvents=true&timeMin=%s"
-            % (max_results * EVENT_FETCH_CALENDAR_MULTIPLIER, time_min)
+            % (requested_max_results, time_min)
         )
         # Keep response small to reduce JSON parse allocations on constrained heaps.
         url += "&fields=items(id,summary,start,colorId)"
@@ -928,6 +952,60 @@ def fetch_next_events(max_results=EVENT_FETCH_MAX_RESULTS):
         finally:
             data = None
             gc.collect()
+
+    # Fallback: if week markers were not included in the main fetch window, query them explicitly.
+    if pappavecka_date is None or mammavecka_date is None:
+        for calendar_id in GOOGLE_CALENDAR_IDS:
+            if pappavecka_date is None:
+                marker_data = None
+                try:
+                    marker_url = (
+                        get_calendar_events_api_url(calendar_id)
+                        + "?maxResults=2&singleEvents=true&timeMin=%s&q=pappavecka&fields=items(start,summary)"
+                        % time_min
+                    )
+                    if time_max:
+                        marker_url += "&timeMax=%s" % time_max
+                    marker_data = get_json_with_retry(marker_url, headers=headers, retries=1)
+                    for marker_event in marker_data.get("items", []):
+                        marker_start = marker_event.get("start", {})
+                        marker_summary = (marker_event.get("summary") or "").strip().lower()
+                        if marker_start.get("date") and marker_summary == "pappavecka":
+                            pappavecka_active = True
+                            pappavecka_date = marker_start.get("date")
+                            break
+                except Exception:
+                    pass
+                finally:
+                    marker_data = None
+                    gc.collect()
+
+            if mammavecka_date is None:
+                marker_data = None
+                try:
+                    marker_url = (
+                        get_calendar_events_api_url(calendar_id)
+                        + "?maxResults=2&singleEvents=true&timeMin=%s&q=mammavecka&fields=items(start,summary)"
+                        % time_min
+                    )
+                    if time_max:
+                        marker_url += "&timeMax=%s" % time_max
+                    marker_data = get_json_with_retry(marker_url, headers=headers, retries=1)
+                    for marker_event in marker_data.get("items", []):
+                        marker_start = marker_event.get("start", {})
+                        marker_summary = (marker_event.get("summary") or "").strip().lower()
+                        if marker_start.get("date") and marker_summary == "mammavecka":
+                            mammavecka_active = True
+                            mammavecka_date = marker_start.get("date")
+                            break
+                except Exception:
+                    pass
+                finally:
+                    marker_data = None
+                    gc.collect()
+
+            if pappavecka_date is not None and mammavecka_date is not None:
+                break
 
     # If a calendar fails during refresh, keep its previous entries so it doesn't disappear.
     if failed_calendar_ids and events:
@@ -1890,6 +1968,7 @@ current_utc_offset_seconds = _parse_utc_offset_seconds("+00:00")
 alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = (None, None, "", None)
 alarm_fired_for_key = None
 alarm_manually_off = False
+alarm_manually_off_until_epoch = None  # epoch of the event that was manually dismissed
 
 def prime_events_view(hour, minute, day, month_short):
     # Pre-populate labels so first touch does not pay all text layout/render cost.
@@ -2190,21 +2269,38 @@ while True:
                 # Refresh alarm display/time against latest offset, unless manually turned off
                 sync_utc_epoch = clock_base_local_epoch - current_utc_offset_seconds
                 prev_key = alarm_event_key
+                # Auto-reset alarm_manually_off once the dismissed alarm's event has started.
+                if alarm_manually_off and alarm_manually_off_until_epoch is not None:
+                    if sync_utc_epoch >= alarm_manually_off_until_epoch:
+                        alarm_manually_off = False
+                        alarm_manually_off_until_epoch = None
                 if not alarm_manually_off:
                     outer_stage = 21
-                    alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
-                        events, current_utc_offset_seconds, sync_utc_epoch
+                    # Don't clear an alarm that is currently within its firing window and
+                    # hasn't fired yet — the trigger check runs later this same loop
+                    # iteration (or has just missed it by milliseconds). Overwriting here
+                    # would prevent the alarm from ever going off.
+                    _alarm_in_active_window = (
+                        alarm_utc_epoch is not None
+                        and alarm_event_utc_epoch is not None
+                        and sync_utc_epoch >= alarm_utc_epoch
+                        and sync_utc_epoch < alarm_event_utc_epoch
+                        and alarm_fired_for_key != alarm_event_key
                     )
-                    if alarm_event_key != prev_key:
-                        alarm_fired_for_key = None
-                        log_alarm_choice(
-                            alarm_utc_epoch,
-                            alarm_event_utc_epoch,
-                            alarm_text,
-                            alarm_event_key,
-                            current_utc_offset_seconds,
-                            sync_utc_epoch,
+                    if not _alarm_in_active_window:
+                        alarm_utc_epoch, alarm_event_utc_epoch, alarm_text, alarm_event_key = schedule_alarm_from_events(
+                            events, current_utc_offset_seconds, sync_utc_epoch
                         )
+                        if alarm_event_key != prev_key:
+                            alarm_fired_for_key = None
+                            log_alarm_choice(
+                                alarm_utc_epoch,
+                                alarm_event_utc_epoch,
+                                alarm_text,
+                                alarm_event_key,
+                                current_utc_offset_seconds,
+                                sync_utc_epoch,
+                            )
             except Exception as e:
                 log_exception("sync_and_refresh", e)
 
